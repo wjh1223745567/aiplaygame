@@ -1,0 +1,12 @@
+server:
+  port: 18080
+
+spring:
+  application:
+    name: autogame-host
+
+logging:
+  level:
+    root: INFO
+    com.autogame: INFO
+    io.modelcontextprotocol: WARN

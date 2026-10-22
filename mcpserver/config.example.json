@@ -1,0 +1,37 @@
+{
+  "window": {
+    "title_keywords": ["问道"],
+    "exclude_keywords": ["更新", "下载", "登录器", "launcher"]
+  },
+  "capture": {
+    "debug_dir": "debug",
+    "save_debug": true
+  },
+  "input": {
+    "click_random_offset": 4,
+    "action_delay_min": 0.12,
+    "action_delay_max": 0.3,
+    "move_duration_sec": 0.18,
+    "stop_hotkey": "f12"
+  },
+  "timing": {
+    "step_pause": 0.4,
+    "click_pause": 0.2,
+    "idle_pause": 0.8
+  },
+  "ocr": {
+    "engine": "rapidocr",
+    "use_det": true,
+    "min_confidence": 0.5
+  },
+  "template": {
+    "templates_dir": "assets/templates",
+    "default_threshold": 0.85
+  },
+  "yolo": {
+    "enabled": false,
+    "model_path": "assets/models/yolo11s.pt",
+    "conf_threshold": 0.5,
+    "device": "cpu"
+  }
+}
