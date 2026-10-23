@@ -1,0 +1,9 @@
+# 换行符统一：仓库里存 LF，按平台检出时转换
+* text=auto eol=lf
+
+# Windows 批处理必须是 CRLF，否则 cmd 解析个别语句（括号块、goto）会出错
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# shell 脚本保持 LF，避免 "bad interpreter: /usr/bin/env bash^M"
+*.sh text eol=lf
