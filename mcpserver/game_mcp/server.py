@@ -1,4 +1,4 @@
-"""问道游戏自动化 · MCP Server 入口（MCPServer, stdio）。
+"""问道游戏自动化 · MCP Server 入口（MCPServer）。
 
 通过 MCP 暴露两类工具：
   · 基础能力：ping / list_windows / capture / ocr / detect / click_point /
@@ -6,7 +6,10 @@
   · 游戏功能：open_game / close_game / game_status / login / daily_task / market_scan（见 tools/）
 
 内部统一复用 BotContext（core/engine.py）；窗口靠 config.window.title_keywords 定位。
-运行：`python -m game_mcp.server`（stdio 传输，由 Java client 拉起）。
+两种传输（由 AUTOGAME_MCP_TRANSPORT 选择）：
+  · stdio（默认）：`python -m game_mcp.server`，由 Java client 作为子进程拉起；
+  · streamable-http：常驻监听，供容器里的 host 通过 AUTOGAME_MCP_URL 连接。
+    因为要操作 macOS 本机窗口，这个进程只能跑在宿主机，不能放进 Linux 容器。
 """
 from __future__ import annotations
 
@@ -313,13 +316,46 @@ def _install_quit_handler() -> None:
         log.debug("注册 SIGTERM 处理失败: %s", e)
 
 
+# 传输方式：stdio（默认，host 以子进程拉起）或 streamable-http（容器化部署时常驻）
+TRANSPORT = os.getenv("AUTOGAME_MCP_TRANSPORT", "stdio").strip().lower()
+HTTP_HOST = os.getenv("AUTOGAME_MCP_HOST", "0.0.0.0").strip()
+HTTP_PORT = int(os.getenv("AUTOGAME_MCP_PORT", "18090"))
+HTTP_PATH = os.getenv("AUTOGAME_MCP_PATH", "/mcp").strip()
+# SDK 默认只放行 localhost 的 Host 头，容器经 host.docker.internal 访问会被 421 拒绝，
+# 所以这里显式列出允许的 Host（逗号分隔，形如 host:port，port 可写 *）。
+HTTP_ALLOWED_HOSTS = [h.strip() for h in os.getenv(
+    "AUTOGAME_MCP_ALLOWED_HOSTS",
+    "127.0.0.1:*,localhost:*,[::1]:*,host.docker.internal:*").split(",") if h.strip()]
+
+
+def _run_streamable_http() -> None:
+    """常驻 HTTP：host 跑在容器里时经 host.docker.internal 连进来。"""
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    log.info("MCP server 监听 http://%s:%d%s allowed_hosts=%s",
+             HTTP_HOST, HTTP_PORT, HTTP_PATH, HTTP_ALLOWED_HOSTS)
+    if HTTP_HOST in ("0.0.0.0", "::"):
+        log.warning("MCP server 绑定 %s，同网段可直连；如需只给本机用，设 AUTOGAME_MCP_HOST=127.0.0.1", HTTP_HOST)
+    app.run(transport="streamable-http", host=HTTP_HOST, port=HTTP_PORT,
+            streamable_http_path=HTTP_PATH,
+            transport_security=TransportSecuritySettings(
+                enable_dns_rebinding_protection=True,
+                allowed_hosts=HTTP_ALLOWED_HOSTS))
+
+
 def main() -> None:
-    log.info("MCP server 启动 transport=stdio pid=%d python=%s 项目根=%s 日志=%s",
-             os.getpid(), platform.python_version(),
+    log.info("MCP server 启动 transport=%s pid=%d python=%s 项目根=%s 日志=%s",
+             TRANSPORT, os.getpid(), platform.python_version(),
              runlog.PROJECT_ROOT, runlog.log_path())
     _install_quit_handler()
     try:
-        app.run(transport="stdio")
+        if TRANSPORT == "stdio":
+            app.run(transport="stdio")
+        elif TRANSPORT in ("http", "streamable-http"):
+            _run_streamable_http()
+        else:
+            raise SystemExit(
+                f"不支持的 AUTOGAME_MCP_TRANSPORT={TRANSPORT}（可选 stdio / streamable-http）")
     except KeyboardInterrupt:
         log.info("MCP server 中断（Ctrl-C）pid=%d", os.getpid())
     except BaseException:  # noqa: BLE001 其余异常连 traceback 一起留痕

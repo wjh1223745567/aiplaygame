@@ -11,10 +11,11 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 持有与 mcpserver 的唯一会话（stdio 子进程），并把业务动作映射到工具调用。
+ * 持有与 mcpserver 的唯一会话（stdio 子进程或 Streamable HTTP），并把业务动作映射到工具调用。
  *
- * <p>{@link GameTools}/{@code McpSyncClient} 是阻塞式的，因此所有调用串行化；
- * 会话首次使用时才拉起 Python 子进程，避免只跑 Web 时也起一个空闲进程。
+ * <p>传输方式由 {@code AUTOGAME_MCP_URL} 决定：未设置时拉起本地 Python 子进程；容器里则连
+ * 宿主机上常驻的 HTTP 端点。{@link GameTools}/{@code McpSyncClient} 是阻塞式的，因此所有调用
+ * 串行化；会话首次使用时才建立，避免只跑 Web 时也占着一条连接。
  */
 @Service
 public class GameService {
@@ -25,7 +26,8 @@ public class GameService {
 
     private synchronized GameTools tools() {
         if (factory == null) {
-            log.info("拉起 mcpserver（stdio）...");
+            String url = McpClientFactory.configuredUrl();
+            log.info(url == null ? "拉起 mcpserver（stdio 子进程）..." : "连接 mcpserver（{}）...", url);
             factory = McpClientFactory.start();
             log.info("mcpserver 已就绪");
         }

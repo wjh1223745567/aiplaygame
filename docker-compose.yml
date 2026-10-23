@@ -1,0 +1,37 @@
+# 容器化部署：host 跑容器，mcpserver 必须跑在宿主机。
+#
+# mcpserver 依赖 pyobjc(Quartz/Cocoa) + pynput + mss 去点 macOS 本机游戏窗口，
+# Linux 容器里没有 WindowServer 也没有辅助功能权限，放进去就只剩一个空壳，
+# 所以它在宿主机上以 Streamable HTTP 常驻，容器经 host.docker.internal 连过来：
+#
+#   bash scripts/run-mcpserver.sh     # 终端 A：监听 0.0.0.0:18090/mcp
+#   docker compose up -d              # 终端 B：host 容器，18080
+#
+services:
+  host:
+    build:
+      context: .
+      dockerfile: host/Dockerfile
+      args:
+        # Docker Hub 直连常不通，改用镜像源：HOST_BASE_IMAGE=docker.1ms.run/library/eclipse-temurin:21-jre docker compose build
+        BASE_IMAGE: ${HOST_BASE_IMAGE:-eclipse-temurin:21-jre}
+    image: autogame-host:0.1.0
+    container_name: autogame-host
+    ports:
+      - "18080:18080"
+    environment:
+      # 指向宿主机上的 mcpserver；改端口时同步改这里
+      AUTOGAME_MCP_URL: ${AUTOGAME_MCP_URL:-http://host.docker.internal:18090/mcp}
+      # 配置、判断日志、debug 截图都按这个根目录找
+      AUTOGAME_ROOT: /app
+      # 留空则用挂载进来的 host/config.json 里的 llm.api_key
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      TZ: Asia/Shanghai
+    extra_hosts:
+      # Docker Desktop 自带 host.docker.internal；Linux 上靠这行才有
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # 挂整个仓库：要读 host/config.json，要把 ai-decisions.log 写回仓库根，
+      # 还要读 mcpserver 截的 debug/*.png（capture 返回的是相对路径）
+      - ./:/app
+    restart: unless-stopped

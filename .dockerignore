@@ -1,0 +1,20 @@
+# 构建上下文只需要 host/target/host.jar 与文档，其余全部排除
+.git
+.gitignore
+.idea
+**/*.iml
+.tools
+assets
+debug
+*.log
+
+# host 镜像里 COPY 的是打好的 jar，中间产物/旧包不需要
+host/target/*
+!host/target/host.jar
+
+# mcpserver 在宿主机原生运行，不进镜像
+mcpserver/.venv
+mcpserver/__pycache__
+mcpserver/game_mcp/__pycache__
+mcpserver/game_mcp/**/__pycache__
+mcpclient/target
