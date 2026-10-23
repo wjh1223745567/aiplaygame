@@ -132,7 +132,7 @@ public final class ChatWindow extends JFrame {
         chatScroll.setBorder(new EmptyBorder(0, 0, 0, 0));
 
         traceArea.setEditable(false);
-        traceArea.setFont(new Font("Consolas", Font.PLAIN, 12));
+        traceArea.setFont(monoFont(12));
         traceArea.setForeground(INK);
         JScrollPane traceScroll = new JScrollPane(traceArea);
 
@@ -276,7 +276,7 @@ public final class ChatWindow extends JFrame {
         int index = 0;
         for (JsonNode step : steps) {
             index++;
-            trace.append("  ↳ [").append(index).append("] ")
+            trace.append("  - [").append(index).append("] ")
                     .append(step.path("tool").asText())
                     .append(' ').append(step.path("args"))
                     .append("  ").append(step.path("ms").asLong()).append("ms")
@@ -475,9 +475,32 @@ public final class ChatWindow extends JFrame {
         });
     }
 
+    /**
+     * 明细区要用等宽字体，但必须能显示中文。
+     *
+     * <p>Consolas 这类西文等宽字体没有中文字形，Windows 上会画成方块（工具返回里的中文全废）。
+     * 逻辑字体 {@code Monospaced}/{@code SansSerif} 由 JDK 组合出中文回退，物理字体没有，
+     * 所以这里按「系统真装了 + 确实能显示中文」两个条件挑，都没有才退回逻辑等宽字体。
+     */
+    private static Font monoFont(int size) {
+        String[] preferred = {
+                "Sarasa Mono SC", "Microsoft YaHei Mono", "Microsoft YaHei UI", "Microsoft YaHei",
+                "PingFang SC", "Hiragino Sans GB", "Menlo",
+        };
+        for (String name : preferred) {
+            Font candidate = new Font(name, Font.PLAIN, size);
+            // 字体不存在时 Java 静默换成 Dialog，getFamily() 就不再是原名，借此排除
+            if (candidate.getFamily().equalsIgnoreCase(name) && candidate.canDisplayUpTo("工具调用") < 0) {
+                return candidate;
+            }
+        }
+        return new Font(Font.MONOSPACED, Font.PLAIN, size);
+    }
+
     /** 无界面自检：只验证配置解析 + 连通性，方便在服务器/CI 上排障。 */
     private static int selftest(ClientConfig config, String message) {
         System.out.println("[selftest] " + config);
+        System.out.println("[selftest] 明细字体=" + monoFont(12).getFamily());
         HostClient host = new HostClient(config.baseUrl());
         try {
             JsonNode tools = host.tools();
