@@ -3,7 +3,7 @@
 通过 MCP 暴露两类工具：
   · 基础能力：ping / list_windows / capture / ocr / detect / click_point /
              click_text / press_key / advise
-  · 游戏功能：open_game / close_game / game_status / login / daily_task / market_scan（见 tools/）
+  · 游戏功能：open_game / close_game / game_status / login / back_to_main / daily_task / market_scan（见 tools/）
 
 内部统一复用 BotContext（core/engine.py）；窗口靠 config.window.title_keywords 定位。
 两种传输（由 AUTOGAME_MCP_TRANSPORT 选择）：
@@ -116,13 +116,17 @@ def _err(msg: str) -> dict:
 # ---------- 基础能力 ----------
 @tool
 def ping() -> str:
-    """连通性自检：往返一次即证明 host->client->server 通路正常。"""
+    """连通性自检：返回字符串 pong。只读、无副作用，排查工具调不通时先用它。"""
     return "pong"
 
 
 @tool
 def list_windows() -> List[dict]:
-    """枚举屏幕上所有可见窗口（用于确认游戏窗口标题/尺寸）。"""
+    """需要核对窗口标题/尺寸、确认游戏窗口是否最小化时用：枚举当前桌面上可见的窗口。
+
+    每项含 window_id/owner/title/x/y/width/height/scale/pid。只读无副作用；
+    最小化或位于其他桌面的窗口不在结果里（这类窗口也无法截图）。
+    """
     return [{
         "window_id": w.window_id, "owner": w.owner, "title": w.title,
         "x": w.x, "y": w.y, "width": w.width, "height": w.height,
@@ -132,7 +136,10 @@ def list_windows() -> List[dict]:
 
 @tool
 def capture(tag: str = "capture") -> dict:
-    """截取游戏窗口并保存到 debug/，返回路径与尺寸。"""
+    """需要“看一眼画面”（留档、给人看）时用：截取游戏窗口并存到 debug/，返回 path/width/height/scale。
+
+    只读无副作用；窗口没打开时返回 ok=false。只想知道画面里有哪些文字用 ocr 更快。
+    """
     try:
         ctx = _make_ctx()
     except RuntimeError as e:
@@ -144,7 +151,11 @@ def capture(tag: str = "capture") -> dict:
 
 @tool
 def ocr(keyword: Optional[str] = None) -> dict:
-    """对游戏窗口做 OCR；keyword 非空时只返回包含该词的文本。"""
+    """需要知道画面里有哪些文字、或拿文字坐标去点击时用：返回 count 与 texts[{text,confidence,box,cx,cy}]。
+
+    keyword 非空时只保留包含该词的文本（比较时忽略空格，“师门任务”能命中“师门 任务”）。
+    只读无副作用；cx/cy 可直接喂给 click_point，点击前不确定目标在哪就先 ocr。
+    """
     try:
         ctx = _make_ctx()
     except RuntimeError as e:
@@ -162,7 +173,12 @@ def ocr(keyword: Optional[str] = None) -> dict:
 
 @tool
 def detect(classes: Optional[List[str]] = None) -> dict:
-    """YOLO 目标检测（临时强制启用，无需改 config.yolo.enabled）。"""
+    """OCR 读不出图标类按钮、需要按图案找目标时用：YOLO 检测返回 count 与
+    detections[{label,confidence,box,cx,cy}]。
+
+    classes 非空时只保留 label 完全相同的检测（区分大小写），为空则返回全部类别；
+    模型加载失败返回 ok=false。只读无副作用。
+    """
     try:
         cfg = cfgmod.load_config()
         win = _find_win(cfg)
@@ -186,7 +202,10 @@ def detect(classes: Optional[List[str]] = None) -> dict:
 
 @tool
 def click_point(x: float, y: float, dry_run: bool = False) -> dict:
-    """点击窗口内像素坐标 (x,y)。dry_run=True 只打印不执行。"""
+    """已知目标的像素坐标时用它精确点击：坐标系与 ocr 的 box、capture 的截图一致（不是屏幕坐标）。
+
+    dry_run=True 只打印不点击。真实操作：只在用户明确要求，或看屏确认位置后使用。
+    """
     try:
         ctx = _make_ctx(dry_run=dry_run)
     except RuntimeError as e:
@@ -197,7 +216,11 @@ def click_point(x: float, y: float, dry_run: bool = False) -> dict:
 
 @tool
 def click_text(text: str, dry_run: bool = False) -> dict:
-    """OCR 定位包含 text 的文本并点击其中心。dry_run=True 只打印不执行。"""
+    """已知目标文字、且画面里该文字唯一时用：找包含 text 的文本并点它的中心。
+
+    默认最多等 10 秒，找不到返回 ok=false 且不点击；有多个同名文本时改用 ocr 拿 cx/cy 再 click_point。
+    dry_run=True 只打印不点击。真实操作：只点用户明确指定的目标。
+    """
     try:
         ctx = _make_ctx(dry_run=dry_run)
     except RuntimeError as e:
@@ -210,18 +233,28 @@ def click_text(text: str, dry_run: bool = False) -> dict:
 
 @tool
 def press_key(key: str, dry_run: bool = False) -> dict:
-    """按下按键（esc/enter/space/tab 或单字符）。dry_run=True 只打印不执行。"""
+    """需要按键盘（Esc 关界面、回车确认、方向键）时用：按一次 esc / enter / space / tab /
+    backspace / delete / 方向键 / f10-f12，或任意单字符。
+
+    dry_run=True 只打印不按键。窗口不在前台时不发送并返回 ok=false（避免按键落到别的应用上）。
+    真实操作：用户明确要求按键时才按。
+    """
     try:
         ctx = _make_ctx(dry_run=dry_run)
     except RuntimeError as e:
         return _err(str(e))
-    ctx.input.press_key(key)
+    if not ctx.input.press_key(key):
+        return _err(f"按键 {key} 未发送：游戏窗口不在前台，避免落到其他应用")
     return _ok(key=key, dry_run=dry_run)
 
 
 @tool
 def advise(goal: str = "", dry_run: bool = True) -> dict:
-    """看当前画面让大模型单轮决策（默认 dry_run 只推荐不点击）。"""
+    """只想让视觉模型给一步建议、不执行任何动作时用：返回 scene/reason/done/actions/candidates。
+
+    goal 是本次目标（为空按“推进当前任务”），必须来自用户原话。要真正连续推进用 daily_task。
+    dry_run 对 advise 无实际影响（它从不点击）。
+    """
     try:
         ctx = _make_ctx(dry_run=dry_run)
     except RuntimeError as e:
@@ -243,7 +276,11 @@ def advise(goal: str = "", dry_run: bool = True) -> dict:
 # ---------- 游戏功能（见 tools/） ----------
 @tool
 def open_game() -> dict:
-    """启动或激活问道客户端并等待游戏窗口出现。"""
+    """用户只说“打开游戏”“把游戏开起来”时用：启动问道客户端，已在运行则只激活窗口，
+    两种情况都等到窗口出现才返回 ok=true。
+
+    真实操作（拉起进程/切前台），不点登录按钮；用户要登录、进到游戏里请用 login。
+    """
     try:
         return game_tools.open_game(cfgmod.load_config())
     except Exception as e:  # noqa: BLE001
@@ -252,10 +289,12 @@ def open_game() -> dict:
 
 @tool
 def close_game(force: bool = False, timeout: float = 2.5) -> dict:
-    """关闭问道客户端：先正常退出（可存档），超时后依次升级 SIGTERM / SIGKILL。
+    """用户说“关闭游戏”“退出游戏”时用：先请应用正常退出（可存档），timeout 秒没退就 SIGTERM，
+    再 1.5 秒仍在则 SIGKILL。
 
-    该客户端对 Cmd+Q / SIGTERM 都不响应，只有 SIGKILL 生效，故各级等待都很短
-    （默认 2.5s -> 1.5s -> 2s）。force=True 跳过优雅退出直接强杀（会丢失未保存进度）。
+    实测该客户端忽略 Cmd+Q 和 SIGTERM，所以默认 2.5 秒就会走到强杀。
+    force=True 跳过前两级直接杀（未保存进度会丢），除非用户明确要求不然不用。
+    返回 closed/killed/forced；本来就没在跑时返回 already_closed=true。
     """
     try:
         return game_tools.close_game(cfgmod.load_config(), timeout=timeout, force=force)
@@ -265,7 +304,11 @@ def close_game(force: bool = False, timeout: float = 2.5) -> dict:
 
 @tool
 def game_status() -> dict:
-    """检测游戏是否已打开（running / window_visible / pids）。"""
+    """用户问“游戏开了吗”“窗口在不在”时用：只读返回 running / window_visible / pids，
+    不会启动或点击任何东西。
+
+    拿到结果直接用中文回答“开着/没开”，不要顺手做别的，也不要贴字段名。
+    """
     try:
         return _ok(**game_tools.is_game_running(cfgmod.load_config()))
     except Exception as e:  # noqa: BLE001
@@ -274,7 +317,13 @@ def game_status() -> dict:
 
 @tool
 def login(timeout: float = 120.0, auto_open: bool = True) -> dict:
-    """自动检测游戏是否打开（未打开则自动启动） -> 点击「登录游戏」 -> 等主场景。"""
+    """用户说“登录”“登录游戏”“进入游戏”“进游戏”时用：一步完成登录并进入游戏主页面。
+
+    流程：未启动先启动 -> 关掉公告/风险提示弹窗 -> 点「进入游戏」-> 处理选角页/二次确认页的
+    进入类按钮 -> 主场景 HUD 出现才返回 ok=true（实测约 10~20 秒）。
+    不要拆成 click_text + game_status（那样点完就收尾，无法确认真的进了主页面）。
+    已在主场景时立即返回 already_in_game=true；auto_open=false 则只处理已经打开的游戏。
+    """
     try:
         return game_tools.login(cfgmod.load_config(), timeout=timeout, auto_open=auto_open)
     except Exception as e:  # noqa: BLE001
@@ -282,8 +331,28 @@ def login(timeout: float = 120.0, auto_open: bool = True) -> dict:
 
 
 @tool
+def back_to_main(max_steps: int = 8) -> dict:
+    """用户说“回到主界面”“返回主界面”“关掉弹窗”“退出来”时用：关掉弹窗/面板并回到游戏主界面。
+
+    顺序：先点「关闭/确定/确认/我知道了」等文字按钮 -> 面板没有文字关闭键就点右上角 X
+    -> 都不行再按 ESC 逐级退出；战斗界面不按 ESC。
+    返回 ok / already_in_main / closed / esc_presses / stage；已在主界面且无弹窗时零操作直接返回。
+    窗口不在前台时返回 stage=not_frontmost，不做任何输入。max_steps 为最大操作步数（默认 8）。
+    """
+    try:
+        return game_tools.back_to_main(cfgmod.load_config(), max_steps=max_steps)
+    except Exception as e:  # noqa: BLE001
+        return _err(f"返回主界面失败: {e}")
+
+
+@tool
 def daily_task(goal: str = "", max_steps: int = 120, dry_run: bool = False) -> dict:
-    """LLM 驱动的每日任务循环（骨架，需实机标定具体流程）。"""
+    """用户说“做师门任务”“做任务”时用：自动循环推进师门任务，内部自己“看屏 -> 决策 -> 点击”，
+    返回 ok/task/steps，默认目标是完成师门任务。
+
+    goal 为空用内置目标；max_steps 是循环上限（默认 120 步，每步调一次视觉模型，整体可能几分钟）；
+    dry_run=True 只看不动。属长耗时操作，调用前先确认游戏已登录进主界面。
+    """
     try:
         ctx = _make_ctx(dry_run=dry_run)
     except RuntimeError as e:
@@ -293,7 +362,11 @@ def daily_task(goal: str = "", max_steps: int = 120, dry_run: bool = False) -> d
 
 @tool
 def market_scan(goal: str = "", max_steps: int = 120, dry_run: bool = False) -> dict:
-    """集市扫货（骨架：OCR 读列表 + LLM 兜底决策，需实机标定筛选规则）。"""
+    """用户说“扫货”“去集市买东西”时用：自动循环在集市里挑符合条件的商品，返回 ok/task/steps。
+
+    goal 可传筛选条件（如“只买低于 1 万的宝石”）；max_steps 是循环上限（默认 120 步）；
+    dry_run=True 只看不动。需要游戏已停在集市/商铺界面，否则大概率空转。
+    """
     try:
         ctx = _make_ctx(dry_run=dry_run)
     except RuntimeError as e:

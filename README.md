@@ -38,7 +38,7 @@ autogame/
 │   │   ├── config.py              # 读 mcpserver/config.json，并合并 host/config.json 的 llm
 │   │   ├── core/                  # 窗口 / 截图 / 输入 / 引擎 / 运行日志(log) / 判断日志(decision_log)
 │   │   ├── vision/                # OCR / 模板匹配 / YOLO / LLM 决策
-│   │   └── tools/                 # game.py(open_game/login/close_game) daily.py(日常/扫货)
+│   │   └── tools/                 # game.py(open_game/login/close_game) daily.py(师门任务/扫货)
 │   ├── requirements.txt
 │   └── smoke_test.py              # Python 侧 stdio 冒烟
 ├── scripts/
@@ -76,7 +76,8 @@ bash scripts/run-host.sh login          # 自动检测/启动游戏 -> 确认前
 bash scripts/run-host.sh status         # 游戏是否已打开（窗口可见/窗口隐藏/进程）
 bash scripts/run-host.sh close          # 关游戏：正常退出 -> SIGTERM -> SIGKILL 逐级升级
 bash scripts/run-host.sh close --force=true   # 直接强杀
-bash scripts/run-host.sh daily --goal=师门 --dry-run=true
+bash scripts/run-host.sh main            # 回主界面：先关弹窗，再按 ESC 逐级退出
+bash scripts/run-host.sh daily --goal=师门任务 --dry-run=true
 bash scripts/run-host.sh serve           # 常驻 AI 服务，默认 18080
 ```
 
@@ -276,9 +277,13 @@ macOS 侧仍可用终端版对话框：`bash scripts/run-chat.sh`（`chat.jar`�
 
 ## 7. 说明与约定
 
-- **工具清单（15）**：`ping`、`list_windows`、`capture`、`ocr`、`detect`、`click_point`、
+- **工具清单（16）**：`ping`、`list_windows`、`capture`、`ocr`、`detect`、`click_point`、
   `click_text`、`press_key`、`advise`、`open_game`、`close_game`、`game_status`、`login`、
-  `daily_task`、`market_scan`。
+  `back_to_main`、`daily_task`、`market_scan`。
+- **工具描述就是提示词**：每个工具的使用场景、触发说法、是否真实操作、返回字段都写在
+  `mcpserver/game_mcp/server.py` 的 docstring 里（MCP 会把它当 description 透给模型）；
+  host 的 `SYSTEM_PROMPT` 只保留对话协议（JSON 格式、tool/reply 二选一、失败两次停手），
+  不再重复工具细节。新增工具时只需在 Python 侧写清描述，Java 不用同步。
 - **登录自动检测**：`login` 先用窗口列表（含最小化/其他桌面的窗口）判断游戏是否已打开；
   未打开则按 `auto_open=true` 自动 `open` 客户端并等待窗口；已在主场景时跳过点击直接返回
   `already_in_game`。登录按钮兼容「进入游戏」「登录游戏」两种客户端文案。登录页与登录过程中
@@ -286,6 +291,9 @@ macOS 侧仍可用终端版对话框：`bash scripts/run-chat.sh`（`chat.jar`�
   关掉过哪些按钮会在返回值的 `dialogs` 里。游戏已开但窗口被最小化/在别的桌面时，会自动尝试激活，
   仍不可见则报错提示手动切到前台（macOS 13 无法可靠跨 Space 拉回窗口，此时截图会是全黑图，
   OCR 必然读不到登录按钮）。
+- **回主界面**：`back_to_main` 用于从面板/弹窗里退出来：画面有「关闭/确定/确认/我知道了」
+  就先点掉（同一按钮最多 3 次），认不出按钮时按 ESC 逐级返回；战斗界面不按 ESC（避免误触逃跑），
+  直接返回 `stage=battle`；已在主界面则返回 `already_in_main` 且不做任何操作。`max_steps` 默认 8。
 - **关闭游戏**：`close_game` 先请应用正常退出（等同 Cmd+Q，客户端有机会存档/下线），
   `timeout` 秒（默认 2.5）内没退就发 SIGTERM，再 1.5 秒仍在则 SIGKILL；`force=true`
   跳过前两级直接强杀。实测该客户端既忽略 Cmd+Q 也忽略 SIGTERM，只有 SIGKILL 生效，

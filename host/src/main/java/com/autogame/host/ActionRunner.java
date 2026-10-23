@@ -11,9 +11,10 @@ import java.util.List;
 
 /**
  * 一次性命令行入口：
- * {@code java -jar host.jar --action=ping|windows|status|login|close|daily|market|chat}。
+ * {@code java -jar host.jar --action=ping|windows|status|login|close|main|daily|market|chat}。
  *
- * <p>可选参数：{@code --goal=...}、{@code --max-steps=120}、{@code --dry-run=true}、
+ * <p>可选参数：{@code --goal=...}、{@code --max-steps=120}（daily/market/main 使用）、
+ * {@code --dry-run=true}、
  * {@code --timeout=120}（login/close 的连接超时，close 默认 8）、
  * {@code --auto-open=false}（仅 login 使用）、{@code --force=true}（仅 close：跳过优雅退出直接强杀）、
  * {@code --message=...} 与 {@code --vision=true|false}（仅 chat 使用）。
@@ -75,12 +76,14 @@ public class ActionRunner implements ApplicationRunner {
             case "login" -> game.login(timeout, autoOpen);
             // 关游戏：默认走正常退出，超时未退自动升级强杀
             case "close" -> game.close(timeout, force);
+            // 回主界面：先关弹窗，再按 ESC 逐级退出
+            case "main" -> game.main(maxSteps);
             case "daily" -> game.daily(goal, maxSteps, dryRun);
             case "market" -> game.market(goal, maxSteps, dryRun);
             // 单轮对话：AI 决策 + 工具编排都在 host 内完成
             case "chat" -> ai.chat("cli", message, vision, maxSteps);
             default -> throw new IllegalArgumentException(
-                    "未知 action: '" + action + "'（可选 ping|windows|status|login|close|daily|market|chat）");
+                    "未知 action: '" + action + "'（可选 ping|windows|status|login|close|main|daily|market|chat）");
         };
     }
 

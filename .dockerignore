@@ -8,6 +8,9 @@ assets
 debug
 *.log
 
+# 客户端便携包（含内置 JRE，200M+；不进镜像也不能进构建上下文）
+dist
+
 # host 镜像里 COPY 的是打好的 jar，中间产物/旧包不需要
 host/target/*
 !host/target/host.jar

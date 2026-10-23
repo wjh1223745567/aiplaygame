@@ -56,8 +56,12 @@ def check_accessibility_or_warn() -> bool:
     return False
 
 _HOTKEYS = {
-    "f12": kb.Key.f12, "f11": kb.Key.f11, "f10": kb.Key.f10,
     "esc": kb.Key.esc, "escape": kb.Key.esc,
+    "enter": kb.Key.enter, "return": kb.Key.enter,
+    "space": kb.Key.space, "tab": kb.Key.tab,
+    "backspace": kb.Key.backspace, "delete": kb.Key.delete,
+    "up": kb.Key.up, "down": kb.Key.down, "left": kb.Key.left, "right": kb.Key.right,
+    "f10": kb.Key.f10, "f11": kb.Key.f11, "f12": kb.Key.f12,
 }
 
 
@@ -83,15 +87,21 @@ class InputController:
         time.sleep(random.uniform(lo, hi))
 
     # ---------- 前台保障 ----------
-    def _ensure_front(self) -> None:
+    def _ensure_front(self) -> bool:
         """动作前确保游戏在顶层：不在顶层则自动切换（点击/按键才落到游戏窗口）。
 
         前台判定很轻量（一次 NSWorkspace 查询），仅在确实需要切换时才激活+短暂等待。
+        返回是否真的切到了前台——键盘事件是全局的，窗口没在前台时会落到别的应用，
+        调用方必须看返回值决定要不要继续。
         """
         try:
-            ensure_front(self.win)
+            return ensure_front(self.win)
         except Exception:  # noqa: BLE001
-            pass
+            return False
+
+    def frontmost(self) -> bool:
+        """确保游戏窗口在前台并返回是否成功（外部调用方用）。"""
+        return self._ensure_front()
 
     # ---------- 鼠标 ----------
     def move_to(self, px: float, py: float) -> None:
@@ -144,21 +154,25 @@ class InputController:
         _log.info("拖拽 (%d,%d) -> (%d,%d)", *p1, *p2)
 
     # ---------- 键盘 ----------
-    def press_key(self, key: str) -> None:
+    def press_key(self, key: str) -> bool:
         if is_stopped():
-            return
+            return False
         if is_dry_run():
             _log.info("dry-run 按键 %s", key)
-            return
-        self._ensure_front()
+            return True
+        # 键盘事件是全局的：窗口不在前台时不发，否则会打到用户当前正在用的应用上
+        if not self._ensure_front():
+            _log.warning("按键 %s 未发送：游戏窗口不在前台，避免落到其他应用", key)
+            return False
         k = _HOTKEYS.get(key.lower())
         if k is None and len(key) == 1:
             k = key.lower()
         if k is None:
             _log.warning("按键 %r 不支持，已忽略", key)
-            return
+            return False
         self._tap(k)
         _log.info("按键 %s", key)
+        return True
 
     def press_enter(self) -> None:
         self._tap(kb.Key.enter)

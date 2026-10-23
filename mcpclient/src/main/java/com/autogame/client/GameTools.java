@@ -10,9 +10,8 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * MCP 工具的 Java 薄封装：只保留命令行与状态查询真正调用的类型化方法
- * （ping / list_windows / game_status / login / close_game / daily_task / market_scan），
- * 其余工具一律经 {@link #invoke(String, Map)} 按名字调用。
+ * 类型化方法覆盖命令行常用动作：ping / list_windows / game_status / login / back_to_main /
+ * close_game / daily_task / market_scan，其余工具一律经 {@link #invoke(String, Map)} 按名字调用。
  *
  * <p>所有方法都返回 server 的结构化结果（{@code structuredContent}）；若 server 只返回
  * JSON 文本，则解析后归一化成 Map/List；非 JSON 文本则归一化成 {@code {"result": ...}}。
@@ -66,6 +65,11 @@ public final class GameTools {
     /** 关闭游戏：先正常退出（可存档），超时未退或 force=true 时强制结束。 */
     public Map<String, Object> closeGame(double timeoutSeconds, boolean force) {
         return call("close_game", Map.of("timeout", timeoutSeconds, "force", force));
+    }
+
+    /** 返回主界面：弹窗先关，认不出按钮就按 ESC 逐级退出。 */
+    public Map<String, Object> backToMain(int maxSteps) {
+        return call("back_to_main", Map.of("max_steps", maxSteps));
     }
 
     public Map<String, Object> dailyTask(String goal, int maxSteps, boolean dryRun) {

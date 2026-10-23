@@ -44,19 +44,9 @@ public class AiChatService {
     private static final int MAX_TOOL_RESULT_CHARS = 1600;
     private static final int MAX_HISTORY_MESSAGES = 40;
 
-    /** 只读工具：调用它们不会改变游戏状态。 */
-    private static final Set<String> READ_ONLY_TOOLS =
-            Set.of("ping", "list_windows", "game_status", "capture", "ocr", "detect");
-
     /** 目标达成类工具：成功后目标已完成，再让模型复述只是多烧一轮 3~4s。 */
     private static final Set<String> TERMINAL_TOOLS =
-            Set.of("close_game", "open_game", "login");
-
-    /** 用户话里出现这些词，才算「明确要求执行操作」，否则本轮按只读处理。 */
-    private static final List<String> ACTION_HINTS = List.of(
-            "打开", "启动", "登录", "点击", "点一下", "点开", "按一下", "按下", "执行", "操作",
-            "帮我一", "帮我", "帮忙", "领一", "做一", "扫货", "日常", "任务", "跑一下",
-            "进入", "退出", "关掉", "关闭", "切到前台", "弄到前台", "激活", "试一下", "试试");
+            Set.of("close_game", "open_game", "login", "back_to_main");
 
     private static final String SYSTEM_PROMPT = """
             你是「问道」桌面自动化的对话调试助手，运行在 host 层，通过 MCP 客户端调用 mcpserver 的工具。
@@ -64,22 +54,26 @@ public class AiChatService {
             每一轮只输出一个 JSON 对象（不要代码围栏、不要任何额外文字）：
             {"thought":"一句话推理","tool":"工具名或空字符串","args":{参数},"reply":"给用户的回答","done":false}
 
+            工具清单随消息给出，每个工具的使用场景、触发说法、是否真实操作、返回字段都写在它的
+            description 里；选工具前先读 description，按它说的判断该不该用、怎么用。
+
             规则：
-            1) 只看不点：询问/诊断类问题（游戏开了吗 / 屏幕上有什么 / 现在什么界面）只用只读工具
-               （ping、list_windows、game_status、capture、ocr），在 reply 里按工具实际返回说明，
-               不要凭想象回答，也不要自作主张去按键、点屏。
-            2) 谨慎操作：click_point、click_text、press_key、advise、login、close_game、daily_task、
-               market_scan 是真实操作，只有用户明确要求执行时才调用；open_game 也仅在用户明确说“打开游戏”时用，
-               close_game 仅在明确说“关闭/退出游戏”时用（force=true 会丢失未保存进度，除非用户要求否则不用）。
-               用户只是询问时，给结论和建议即可。
-            3) 参数必须符合工具清单里的 JSON Schema；缺信息就先调别的工具查清楚。
-            4) 工具返回 ok=false 时，把 error 原样转述给用户，绝不假装成功；
+            1) 看还是做，由你按用户这句话的真实意图判断：
+               - 询问/诊断（游戏开了吗 / 屏幕上有什么 / 现在什么界面）：用只读工具查清后，
+                 在 reply 里用中文自然语言按实际返回回答（不要把 JSON 或字段名贴给用户），
+                 随即 done=true 收尾，不要自己再找下一步动作；
+               - 明确要求动手（登录 / 打开游戏 / 帮我做师门任务 / 点某处）：才调用操作类工具。
+            2) 参数按工具描述里写的名字和含义传；缺信息就先调别的工具查清楚。
+            3) 工具返回 ok=false 时，把 error 原样转述给用户，绝不假装成功；
                同一个工具 + 同一参数失败两次就停下汇报，不要换着法子重试。
-            5) 不需要再调工具、或目标已达成时：tool 留空、done=true，用 reply 给结论。
-            6) 用户给的是游戏目标（例如“领一下每日”）时，按「先看屏 -> 再决策 -> 执行 -> 复检」推进，
+            4) tool 与 reply 二选一：要调工具就把 reply 留空；要回答就把 tool 留空并 done=true。
+               工具结果已经能回答用户时（例如问「游戏开了吗」拿到 game_status 后），下一轮必须收尾，
+               不要重复调用同一个工具。
+            5) 用户明确给出游戏目标（例如“做一下师门任务”）时，按「先看屏 -> 再决策 -> 执行 -> 复检」推进，
                最多几步就先汇报进展，不要无限点。
-            7) 只使用清单里真实存在的工具名，不要发明工具。
-            8) 窗口不可见/被最小化时，如实告诉用户“需要手动切到前台”，不要尝试用按键去切窗口。
+            6) 只使用清单里真实存在的工具名，不要发明工具。
+            7) 窗口不可见/被最小化时，如实告诉用户“需要手动切到前台”，不要尝试用按键去切窗口。
+            8) 目标只来自用户原话：用户没提的事不要替他决定，不要自行补出「师门任务」「领奖励」。
             """;
 
     private final GameService game;
@@ -157,9 +151,7 @@ public class AiChatService {
                                          boolean withVision, int maxRounds, TurnLog turn) {
         session.stripImages();
         session.append(userMessage(userText, withVision));
-        // 小模型对「只读」约束经常阳奉阴违，所以这里做确定性拦截：
-        // 用户这句话没有操作类措辞时，本轮只允许只读工具，第一次越界就收尾。
-        boolean readOnlyTurn = !looksLikeAction(userText);
+        // 是「只查」还是「动手」由模型按用户意图自行判断，host 不再按关键词硬拦
         List<Map<String, Object>> steps = new ArrayList<>();
         // 同一「工具+参数」的尝试次数：模型有时会绕着同一件事反复撞墙，这里做硬限制
         Map<String, Integer> attempts = new LinkedHashMap<>();
@@ -206,22 +198,6 @@ public class AiChatService {
                 return result(true, reply.isBlank() ? "（本轮没有内容）" : reply, steps, round);
             }
 
-            if (readOnlyTurn && !READ_ONLY_TOOLS.contains(tool)) {
-                String note = "已拒绝 " + tool + "：这句话是在询问，本轮只读，没有执行任何操作";
-                Map<String, Object> step = new LinkedHashMap<>();
-                step.put("tool", tool);
-                step.put("args", args);
-                step.put("ms", 0L);
-                step.put("error", false);
-                step.put("refused", true);
-                step.put("result", note);
-                steps.add(step);
-                record.put("refused", true);
-                record.put("note", "本轮按只读处理，未执行 " + tool);
-                return result(true, note + "。如果确实要我动手，请明确说「打开游戏」「登录」"
-                        + "「帮我做每日」之类。", steps, round);
-            }
-
             long started = System.currentTimeMillis();
             Object output;
             boolean failed = false;
@@ -264,6 +240,12 @@ public class AiChatService {
                 return result(false, "同一操作已失败 " + tried + " 次，先停在这里：" + rendered, steps, round);
             }
             if (tried >= 3) {
+                // 模型已经给出结论，只是漏了 done：直接用它的 reply 收尾，别把回答埋进错误里
+                String reply = text(plan.get("reply"));
+                if (!reply.isBlank()) {
+                    turn.note("同一操作重复 " + tried + " 次且模型已给出结论，按其 reply 收尾");
+                    return result(true, reply, steps, round);
+                }
                 return result(false, "同一操作重复 " + tried + " 次，疑似卡住，先停在这里：" + rendered,
                         steps, round);
             }
@@ -284,15 +266,16 @@ public class AiChatService {
 
     /**
      * 这次工具成功是否足以结束本轮：用户同一句话里还要求了后续动作时（如「打开游戏并登录」
-     * 「登录后做每日」）不能提前收尾，否则后半句会被丢掉。
+     * 「登录后做师门任务」）不能提前收尾，否则后半句会被丢掉。
      */
     private static boolean terminalNow(String tool, String userText) {
         if (!TERMINAL_TOOLS.contains(tool)) {
             return false;
         }
         return switch (tool) {
-            case "open_game" -> !containsAny(userText, "登录", "进入游戏", "每日", "任务", "日常", "扫货");
-            case "login" -> !containsAny(userText, "每日", "任务", "日常", "扫货", "领取");
+            case "open_game" -> !containsAny(userText, "登录", "进入游戏", "师门", "任务", "日常", "扫货");
+            case "login" -> !containsAny(userText, "师门", "任务", "日常", "扫货", "领取");
+            case "back_to_main" -> !containsAny(userText, "师门", "任务", "日常", "扫货", "领取", "登录");
             case "close_game" -> !containsAny(userText, "登录", "打开", "启动");
             default -> true;
         };
@@ -334,6 +317,14 @@ public class AiChatService {
                 }
                 return "登录流程结束（阶段：" + stage + "）。";
             }
+            case "back_to_main" -> {
+                if (Boolean.TRUE.equals(m.get("already_in_main"))) {
+                    return "本来就在游戏主界面，没有做任何操作。";
+                }
+                String closed = text(m.get("closed"));
+                return "已回到游戏主界面"
+                        + (closed.isEmpty() || closed.equals("[]") ? "。" : "，关掉了 " + closed + "。");
+            }
             default -> {
                 return tool + " 已执行：" + toJson(output);
             }
@@ -343,10 +334,10 @@ public class AiChatService {
     /** 用户消息：文字 +（可选）当前游戏截图，让视觉模型直接看画面。 */
     private Map<String, Object> userMessage(String text, boolean withVision) {
         List<Map<String, Object>> content = new ArrayList<>();
-        // 小模型容易忽略 system 里的约束，每轮在用户消息尾部再强调一次只读默认
+        // 每轮附一句轻提醒：是否动手由模型按用户意图自行判断，host 不再按关键词拦截
         content.add(Map.of("type", "text", "text", text
-                + "\n（提醒：本轮默认只读。除非这句话明确要求执行操作，否则只允许"
-                + " ping、list_windows、game_status、capture、ocr；越界的工具会被 host 直接拒绝。）"));
+                + "\n（提醒：按这句话的真实意图选工具——只是询问就用只读工具，"
+                + "明确要求动手才执行操作；拿不准就先只读，再在 reply 里问清楚。）"));
         if (withVision) {
             String dataUrl = snapshotDataUrl();
             if (dataUrl != null) {
@@ -427,7 +418,15 @@ public class AiChatService {
             return cached;
         }
         try {
-            cached = JSON.writerWithDefaultPrettyPrinter().writeValueAsString(game.toolSpecs());
+            // 模型选工具主要看 name + description；inputSchema 会把清单揍大一倍多，
+            // 小模型（glm-4v-flash）在长 JSON 里反而抓不住描述，这里只透这两项。
+            List<Map<String, Object>> brief = new ArrayList<>();
+            for (Map<String, Object> spec : game.toolSpecs()) {
+                brief.add(Map.of(
+                        "name", String.valueOf(spec.get("name")),
+                        "description", String.valueOf(spec.get("description"))));
+            }
+            cached = JSON.writerWithDefaultPrettyPrinter().writeValueAsString(brief);
         } catch (Exception e) {
             return "（工具清单生成失败：" + e.getMessage() + "）";
         }
@@ -513,16 +512,6 @@ public class AiChatService {
 
     private static String normalizeSession(String sessionId) {
         return sessionId == null || sessionId.isBlank() ? "default" : sessionId.trim();
-    }
-
-    /** 这句话里有没有「让我动手」的措辞；没有就按只读处理。 */
-    private static boolean looksLikeAction(String text) {
-        for (String hint : ACTION_HINTS) {
-            if (text.contains(hint)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     // ---------- 判断日志 ----------

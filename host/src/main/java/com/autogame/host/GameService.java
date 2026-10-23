@@ -58,6 +58,11 @@ public class GameService {
         return tools().dailyTask(goal, maxSteps, dryRun);
     }
 
+    /** 返回主界面：画面上的弹窗先关，认不出按钮就按 ESC 逐级退出。 */
+    public synchronized Map<String, Object> main(int maxSteps) {
+        return tools().backToMain(maxSteps);
+    }
+
     public synchronized Map<String, Object> market(String goal, int maxSteps, boolean dryRun) {
         return tools().marketScan(goal, maxSteps, dryRun);
     }
