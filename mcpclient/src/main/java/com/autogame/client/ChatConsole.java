@@ -1,18 +1,11 @@
 package com.autogame.client;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.net.URI;
-import java.net.URLEncoder;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -33,8 +26,6 @@ import java.util.Map;
  */
 public class ChatConsole {
 
-    private static final ObjectMapper JSON = new ObjectMapper();
-
     private static final String HELP = """
             可用命令（都以 : 开头，其余输入都会转成对话发给 host）：
               :help              显示本帮助
@@ -47,7 +38,7 @@ public class ChatConsole {
             """;
 
     private final String base;
-    private final HttpClient http;
+    private final HostClient host;
     private final BufferedReader in;
 
     private String session;
@@ -55,10 +46,10 @@ public class ChatConsole {
     private Boolean vision;
 
     public ChatConsole(String base, String session, Boolean vision) {
-        this.base = base.endsWith("/") ? base.substring(0, base.length() - 1) : base;
+        this.host = new HostClient(base);
+        this.base = host.base();
         this.session = session;
         this.vision = vision;
-        this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
         this.in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
     }
 
@@ -126,11 +117,11 @@ public class ChatConsole {
     /** 启动前先确认 host 在跑，并顺带展示工具数量。 */
     private boolean healthCheck() {
         try {
-            JsonNode tools = request("GET", "/ai/tools", null);
+            JsonNode tools = host.tools();
             System.out.println("[chat] host: " + base + "，工具 " + tools.path("count").asInt(0) + " 个，会话: " + session);
             return true;
         } catch (Exception e) {
-            System.err.println("[chat] 连不上 host（" + base + "）：" + rootMessage(e));
+            System.err.println("[chat] 连不上 host（" + base + "）：" + HostClient.rootMessage(e));
             System.err.println("[chat] 先启动 AI 服务：bash scripts/run-host.sh serve");
             return false;
         }
@@ -145,19 +136,13 @@ public class ChatConsole {
 
     /** 发一轮对话，打印每一步工具调用与最终回答。返回是否成功。 */
     private boolean ask(String message) {
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("message", message);
-        body.put("session", session);
-        if (vision != null) {
-            body.put("vision", vision);
-        }
         System.out.println();
         long started = System.currentTimeMillis();
         JsonNode out;
         try {
-            out = request("POST", "/ai/chat?session=" + encode(session), body);
+            out = host.chat(session, message, vision);
         } catch (Exception e) {
-            System.err.println("[失败] " + rootMessage(e));
+            System.err.println("[失败] " + HostClient.rootMessage(e));
             return false;
         }
         long ms = System.currentTimeMillis() - started;
@@ -198,10 +183,10 @@ public class ChatConsole {
                     return false;
                 }
                 case ":help", ":h", ":?" -> System.out.println(HELP);
-                case ":tools" -> printTools(request("GET", "/ai/tools", null));
-                case ":history" -> printHistory(request("GET", "/ai/history?session=" + encode(session), null));
+                case ":tools" -> printTools(host.tools());
+                case ":history" -> printHistory(host.history(session));
                 case ":reset" -> {
-                    JsonNode out = request("POST", "/ai/reset?session=" + encode(session), null);
+                    JsonNode out = host.reset(session);
                     System.out.println("[chat] 已清空会话 " + out.path("session").asText(session));
                 }
                 case ":session" -> switchSession(arg);
@@ -209,7 +194,7 @@ public class ChatConsole {
                 default -> System.out.println("[chat] 未知命令 " + cmd + "，输入 :help 查看");
             }
         } catch (Exception e) {
-            System.err.println("[失败] " + rootMessage(e));
+            System.err.println("[失败] " + HostClient.rootMessage(e));
         }
         return true;
     }
@@ -274,7 +259,7 @@ public class ChatConsole {
             String content = message.path("content").isTextual()
                     ? message.path("content").asText()
                     : message.path("content").toString();
-            System.out.println("  " + i + ". [" + message.path("role").asText() + "] " + oneLine(content, 300));
+            System.out.println("  " + i + ". [" + message.path("role").asText() + "] " + HostClient.oneLine(content, 300));
         }
     }
 
@@ -282,59 +267,10 @@ public class ChatConsole {
         if (text == null || text.isEmpty()) {
             return;
         }
-        System.out.println(indent + oneLine(text, 900));
-    }
-
-    private static String oneLine(String text, int max) {
-        String flat = text.replace("\r", "").replace("\n", " ");
-        if (flat.length() <= max) {
-            return flat;
-        }
-        return flat.substring(0, max) + "…(截断)";
-    }
-
-    // ---------- HTTP ----------
-
-    private JsonNode request(String method, String path, Map<String, Object> body)
-            throws IOException, InterruptedException {
-        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(base + path))
-                // 一轮对话可能串起多次模型调用，给足时间
-                .timeout(Duration.ofSeconds(300))
-                .header("Accept", "application/json");
-        if (body == null) {
-            builder.method(method, HttpRequest.BodyPublishers.noBody());
-        } else {
-            builder.header("Content-Type", "application/json; charset=utf-8")
-                    .method(method, HttpRequest.BodyPublishers.ofString(
-                            JSON.writeValueAsString(body), StandardCharsets.UTF_8));
-        }
-        HttpResponse<String> response = http.send(builder.build(),
-                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        String text = response.body();
-        if (response.statusCode() >= 300) {
-            throw new IOException("HTTP " + response.statusCode() + ": " + oneLine(String.valueOf(text), 300));
-        }
-        if (text == null || text.isBlank()) {
-            return JSON.createObjectNode();
-        }
-        return JSON.readTree(text);
+        System.out.println(indent + HostClient.oneLine(text, 900));
     }
 
     // ---------- 小工具 ----------
-
-    private static String encode(String value) {
-        return URLEncoder.encode(value, StandardCharsets.UTF_8);
-    }
-
-    /** 只保留最内层异常信息，避免把堆栈糊在对话里。 */
-    private static String rootMessage(Throwable e) {
-        Throwable cause = e;
-        while (cause.getCause() != null && cause.getCause() != cause) {
-            cause = cause.getCause();
-        }
-        String message = cause.getMessage();
-        return cause.getClass().getSimpleName() + (message == null ? "" : ": " + message);
-    }
 
     /** 支持 --key=value 与 --key value 两种写法。 */
     private static Map<String, String> parseOptions(String[] args) {

@@ -17,6 +17,9 @@ mcpserver/.venv/
 # Java 构建产物
 **/target/
 
+# 客户端便携包产物（scripts/build-client-win.sh 生成，含内置 JRE，体积大）
+dist/
+
 # 含大模型密钥等敏感信息，不入库；各自用 config.example.json 作模板
 host/config.json
 mcpserver/config.json

@@ -22,10 +22,14 @@ autogame/
 │       ├── DecisionLog.java       # 模型判断日志（项目根 ai-decisions.log）
 │       └── ChatApi.java           # AI 服务接口：/ai/chat|tools|history|reset
 ├── mcpclient/               # MCP 客户端层（官方 MCP Java SDK）
+│   ├── packaging/                 # Windows 客户端启动脚本与包内说明
 │   └── src/main/java/com/autogame/client/
 │       ├── McpClientFactory.java  # stdio 拉起 Python server + initialize 握手
 │       ├── GameTools.java         # 少量类型化方法 + toolSpecs/invoke 泛型入口
-│       └── ChatConsole.java       # 对话调试台（chat.jar 的主类）
+│       ├── HostClient.java        # /ai/* 的 HTTP 门面（控制台与界面共用）
+│       ├── ChatConsole.java       # 终端对话框（chat.jar 的主类）
+│       ├── ClientConfig.java      # 客户端 IP/端口配置读写（client.properties）
+│       └── ChatWindow.java        # 图形客户端（client.jar 的主类）
 ├── mcpserver/               # MCP 服务层（Python 3.13 / mcp SDK 2.x）
 │   ├── config.json                # 游戏侧配置（窗口/截图/输入/OCR/模板/YOLO）
 │   ├── config.example.json        # 同上模板
@@ -41,10 +45,14 @@ autogame/
 │   ├── bootstrap.sh         # 一键装 JDK + venv + 依赖 + 构建 Java
 │   ├── env.sh               # source 后得到 JAVA_HOME / 三层目录变量
 │   ├── run-host.sh          # 按需构建并运行 host（源文件比 jar 新就重构建）
-│   └── run-chat.sh          # 对话调试台（构建并运行 mcpclient/target/chat.jar）
+│   ├── run-chat.sh          # 对话调试台（构建并运行 mcpclient/target/chat.jar）
+│   ├── run-mcpserver.sh     # 以 Streamable HTTP 常驻 mcpserver（容器化 host 用）
+│   └── build-client-win.sh  # 打 Windows 便携客户端（client.jar + JRE + bat -> zip）
 ├── assets/                  # 模板图、YOLO 权重（与 mcpserver 共用）
 ├── ai-decisions.log          # 运行时生成：大模型每次判断的日志（已 gitignore）
 ├── mcpserver.log             # 运行时生成：mcpserver 工具调用/动作/异常日志（已 gitignore）
+├── host/Dockerfile           # host 镜像（只装 JRE + host.jar）
+├── docker-compose.yml        # 编排：host 进容器，mcpserver 留在宿主机
 └── pom.xml                  # 父 POM，聚合 mcpclient + host
 ```
 
@@ -195,7 +203,78 @@ AUTOGAME_LOG_STDERR=INFO ./scripts/run-host.sh chat   # 同时把 INFO 回显到
   WARNING）；目录：`AUTOGAME_ROOT`。文件超过 5MB 轮转为 `mcpserver.log.1`。
 - 日志已加入 `.gitignore`；写失败会自动降级为只出 stderr，不影响工具执行。
 
-## 5. 说明与约定
+## 5. Docker 部署（host 进容器，mcpserver 留在宿主机）
+
+`mcpserver` 要操作 macOS 本机窗口（pyobjc/Quartz + pynput + mss），容器里既没有 WindowServer
+也没有辅助功能权限，塞进去只是个空壳；所以只把 `host` 容器化，它经 `host.docker.internal`
+连宿主机上常驻的 `mcpserver`：
+
+```bash
+bash scripts/run-mcpserver.sh     # 终端 A：mcpserver 常驻 http://0.0.0.0:18090/mcp
+docker compose up -d              # 终端 B：构建并启动 host 容器，对外 18080
+docker compose logs -f host       # 出现「mcpserver 已就绪」即握手成功
+curl -s localhost:18080/ai/tools  # 应返回 15 个工具
+```
+
+| 变量 | 作用 | 默认 |
+| --- | --- | --- |
+| `AUTOGAME_MCP_URL` | 容器内连 mcpserver 的完整端点 | `http://host.docker.internal:18090/mcp` |
+| `AUTOGAME_MCP_TRANSPORT` / `_HOST` / `_PORT` / `_PATH` | mcpserver 的传输方式、监听地址与路径 | `streamable-http` / `0.0.0.0` / `18090` / `/mcp` |
+| `AUTOGAME_MCP_ALLOWED_HOSTS` | mcpserver 的 DNS rebinding 白名单，容器访问须含 `host.docker.internal:*` | 已含该项 |
+| `AUTOGAME_ROOT` | 容器内找配置/写日志/读截图的根目录 | `/app`（compose 挂载整个仓库） |
+| `LLM_API_KEY` | 覆盖 `host/config.json` 里的密钥 | 空（用配置文件里的） |
+| `HOST_BASE_IMAGE` | 构建 host 镜像的基础镜像 | `eclipse-temurin:21-jre` |
+
+Docker Hub 直连在国内经常不通，表现为 `docker compose build` 长时间无输出（daemon 卡在连
+`registry-1.docker.io` 上重试）。先换镜像源再构建：
+
+```bash
+docker pull docker.1ms.run/library/eclipse-temurin:21-jre
+docker tag docker.1ms.run/library/eclipse-temurin:21-jre eclipse-temurin:21-jre
+# 或者不改 tag，构建时直接指定基础镜像：
+HOST_BASE_IMAGE=docker.1ms.run/library/eclipse-temurin:21-jre docker compose build
+```
+
+## 6. Windows 图形客户端（免装 Java）
+
+给「Windows 上发话、macOS 上跑游戏」用：客户端只负责输入与展示，模型决策在 host，截图与
+键鼠操作在 mcpserver。打包产物自带 JRE 21，目标机解压即用。
+
+```bash
+bash scripts/build-client-win.sh                                              # 默认预置 192.168.0.31:18080
+CLIENT_HOST=192.168.0.50 CLIENT_PORT=18080 bash scripts/build-client-win.sh   # 换地址再打包
+```
+
+产物：`dist/autogame-client-win-x64.zip`（约 53M，解压约 151M；已 gitignore）。
+
+```text
+autogame-client-win-x64/
+├── start-client.bat   启动器（用包内 runtime\bin\javaw.exe，无黑色控制台窗口）
+├── client.jar         客户端本体（shade 已含 Jackson 等全部依赖）
+├── runtime/           Adoptium JRE 21 windows-x64
+├── client.properties  预置的服务地址
+└── README.txt         包内使用与排查说明
+```
+
+用法：解压 → 双击 `start-client.bat` → 顶部「服务 IP / 端口」填 host 的地址点「连接」
+（成功后状态栏显示「已连接 … 工具 15 个」）→ 输入框打字，按「发送」或 `Ctrl+Enter`。
+上方是对话，下方是这一轮 AI 调用了哪些工具、参数、耗时、返回。
+
+- 地址填一次就存进同目录 `client.properties`，下次自动带出；也可直接把
+  `http://192.168.0.31:18080` 粘进「服务 IP」，端口会自动拆出来。
+- host 跑在容器里时，Windows 连的是**宿主机 IP**（如 `192.168.0.31:18080`），不是容器 IP。
+- 无界面自检（排障用，在本目录的 cmd 里执行），会打印生效地址、读到的配置文件位置、
+  工具数量，连不上时给出具体异常：
+
+```bat
+runtime\bin\java.exe -jar client.jar --selftest --base=http://192.168.0.31:18080
+```
+
+命令行参数：`--host` / `--port` / `--base` / `--session` / `--vision`。
+
+macOS 侧仍可用终端版对话框：`bash scripts/run-chat.sh`（`chat.jar`，同样支持 `--base`）。
+
+## 7. 说明与约定
 
 - **工具清单（15）**：`ping`、`list_windows`、`capture`、`ocr`、`detect`、`click_point`、
   `click_text`、`press_key`、`advise`、`open_game`、`close_game`、`game_status`、`login`、
