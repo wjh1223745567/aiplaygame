@@ -44,7 +44,7 @@ public class ActionRunner implements ApplicationRunner {
         int maxSteps = Integer.parseInt(option(args, "max-steps", "120"));
         boolean dryRun = Boolean.parseBoolean(option(args, "dry-run", "false"));
         double timeout = Double.parseDouble(option(args, "timeout",
-                "close".equals(action) ? "8" : "120"));
+                "close".equals(action) ? "2.5" : "120"));
         boolean autoOpen = Boolean.parseBoolean(option(args, "auto-open", "true"));
         boolean force = Boolean.parseBoolean(option(args, "force", "false"));
         String message = option(args, "message", "");

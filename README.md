@@ -208,10 +208,13 @@ AUTOGAME_LOG_STDERR=INFO ./scripts/run-host.sh chat   # 同时把 INFO 回显到
   仍不可见则报错提示手动切到前台（macOS 13 无法可靠跨 Space 拉回窗口，此时截图会是全黑图，
   OCR 必然读不到登录按钮）。
 - **关闭游戏**：`close_game` 先请应用正常退出（等同 Cmd+Q，客户端有机会存档/下线），
-  `timeout` 秒（默认 8）内没退就发 SIGTERM，再 3 秒仍在则 SIGKILL；`force=true` 跳过前两级
-  直接强杀。实测该客户端会忽略 Cmd+Q，所以默认路径一般会走到强杀，返回值里的 `killed`
-  就是被强杀的 PID（`forced=true`）。本来就没在跑时返回 `already_closed`。
+  `timeout` 秒（默认 2.5）内没退就发 SIGTERM，再 1.5 秒仍在则 SIGKILL；`force=true`
+  跳过前两级直接强杀。实测该客户端既忽略 Cmd+Q 也忽略 SIGTERM，只有 SIGKILL 生效，
+  所以各级等待都很短（轮询 0.2s），避免为了「优雅」空等十几秒：正常路径约 4.5s 完成，
+  返回值里的 `killed` 就是被强杀的 PID（`forced=true`）。本来就没在跑时返回 `already_closed`。
   窗口最小化/在其他桌面也照样能关（按 PID 结束，不依赖截图）。
+- **收尾即返回**：`close_game`/`open_game`/`login` 返回 `ok=true` 时目标已达成，host 直接
+  用工具返回拼出回复并结束本轮（判断日志备注「跳过模型复核」），不再多跑一轮模型（省 3~4s）。
 - **Jackson 版本**：MCP Java SDK 1.1.5 默认用 Jackson 3，与 Spring Boot 3.3 管理的 Jackson 2 冲突
   （`JsonProperty.isRequired` 签名不同 → `NoSuchMethodError`），`mcpclient/pom.xml` 已排除
   `mcp-json-jackson3` 并换用 `mcp-json-jackson2`。

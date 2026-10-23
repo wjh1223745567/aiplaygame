@@ -48,6 +48,10 @@ public class AiChatService {
     private static final Set<String> READ_ONLY_TOOLS =
             Set.of("ping", "list_windows", "game_status", "capture", "ocr", "detect");
 
+    /** 目标达成类工具：成功后目标已完成，再让模型复述只是多烧一轮 3~4s。 */
+    private static final Set<String> TERMINAL_TOOLS =
+            Set.of("close_game", "open_game", "login");
+
     /** 用户话里出现这些词，才算「明确要求执行操作」，否则本轮按只读处理。 */
     private static final List<String> ACTION_HINTS = List.of(
             "打开", "启动", "登录", "点击", "点一下", "点开", "按一下", "按下", "执行", "操作",
@@ -248,6 +252,13 @@ public class AiChatService {
                             + "\n（继续则输出下一个 JSON 指令；已完成则 tool 留空并给出 reply）"));
             session.trim(MAX_HISTORY_MESSAGES);
 
+            // 收尾类工具 ok=true 就说明目标已达成，直接用确定性文案收尾，不再追加一轮模型复核
+            if (!bad && terminalNow(tool, userText)) {
+                record.put("terminal", true);
+                turn.note(tool + " 已成功，按工具结果直接收尾（跳过模型复核）");
+                return result(true, terminalReply(tool, output), steps, round);
+            }
+
             int tried = attempts.merge(tool + " " + toJson(args), 1, Integer::sum);
             if (tried >= 2 && bad) {
                 return result(false, "同一操作已失败 " + tried + " 次，先停在这里：" + rendered, steps, round);
@@ -269,6 +280,64 @@ public class AiChatService {
         out.put("steps", steps);
         out.put("rounds", rounds);
         return out;
+    }
+
+    /**
+     * 这次工具成功是否足以结束本轮：用户同一句话里还要求了后续动作时（如「打开游戏并登录」
+     * 「登录后做每日」）不能提前收尾，否则后半句会被丢掉。
+     */
+    private static boolean terminalNow(String tool, String userText) {
+        if (!TERMINAL_TOOLS.contains(tool)) {
+            return false;
+        }
+        return switch (tool) {
+            case "open_game" -> !containsAny(userText, "登录", "进入游戏", "每日", "任务", "日常", "扫货");
+            case "login" -> !containsAny(userText, "每日", "任务", "日常", "扫货", "领取");
+            case "close_game" -> !containsAny(userText, "登录", "打开", "启动");
+            default -> true;
+        };
+    }
+
+    private static boolean containsAny(String text, String... hints) {
+        for (String hint : hints) {
+            if (text.contains(hint)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 收尾类工具成功后的确定性回复：直接读工具返回的关键字段，不依赖模型再总结。 */
+    private static String terminalReply(String tool, Object output) {
+        Map<?, ?> m = output instanceof Map<?, ?> map ? map : Map.of();
+        switch (tool) {
+            case "close_game" -> {
+                if (Boolean.TRUE.equals(m.get("already_closed"))) {
+                    return "游戏本来就没在运行，无需关闭。";
+                }
+                boolean forced = Boolean.TRUE.equals(m.get("forced"));
+                return "游戏已关闭" + (forced ? "（未响应正常退出，已强制结束进程 " : "（已正常退出，进程 ")
+                        + text(m.get("closed")) + "）。";
+            }
+            case "open_game" -> {
+                if (Boolean.TRUE.equals(m.get("already_running"))) {
+                    return "游戏已经在运行，窗口：" + text(m.get("window"));
+                }
+                return "游戏已启动，窗口：" + text(m.get("window"));
+            }
+            case "login" -> {
+                String stage = text(m.get("stage"));
+                if ("main_scene".equals(stage)) {
+                    return Boolean.TRUE.equals(m.get("already_in_game"))
+                            ? "本来就已在游戏主场景，没有重复登录。"
+                            : "已登录并进入游戏主场景。";
+                }
+                return "登录流程结束（阶段：" + stage + "）。";
+            }
+            default -> {
+                return tool + " 已执行：" + toJson(output);
+            }
+        }
     }
 
     /** 用户消息：文字 +（可选）当前游戏截图，让视觉模型直接看画面。 */

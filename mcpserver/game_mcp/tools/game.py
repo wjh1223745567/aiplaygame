@@ -26,8 +26,21 @@ MAIN_SCENE_HINTS = ["商城", "包裹", "任务", "自动", "地图", "经验"]
 LOADING_HINTS = ["登录中", "排队", "加载", "连接服务器", "正在连接"]
 # 登录前的提示弹窗（公告 / 设备风险提示 / 协议更新）：“确定”类按钮，长的放前面优先命中
 DIALOG_CONFIRM_BUTTONS = ["我知道了", "知道了", "确定", "确认"]
+# 弹窗正文关键字：按钮文案 OCR 不稳时靠它认定「画面被弹窗挡住」
+DIALOG_HINTS = ["安全风险", "切换到正常环境"]
 # 同一个按钮最多点几次，防止弹窗关不掉时死磕
 DIALOG_MAX_CLICKS = 3
+# 正文命中却找不到按钮时，在正文下方这个像素距离处兜底点一下
+DIALOG_FALLBACK_DY = 60
+# 连续这么多轮关不掉就不再空等，直接返回失败
+DIALOG_STUCK_LIMIT = 4
+
+# 关闭策略：该客户端实测对 Cmd+Q 和 SIGTERM 都不理会，只有 SIGKILL 真正生效，
+# 所以每级只留极短等待（给存档一次机会），不再为了「优雅」空等十几秒。
+CLOSE_QUIT_WAIT = 2.5   # 正常退出（等同 Cmd+Q）等待
+CLOSE_TERM_WAIT = 1.5   # SIGTERM 等待
+CLOSE_KILL_WAIT = 2.0   # SIGKILL 后确认进程消失的等待
+CLOSE_POLL = 0.2        # 探活轮询间隔
 
 
 def _window(cfg: dict, include_offscreen: bool = False):
@@ -126,13 +139,15 @@ def open_game(cfg: dict, wait_timeout: float = 90.0) -> dict:
     return {"ok": False, "error": f"等待窗口超时（{wait:.0f}s）：客户端可能未启动成功"}
 
 
-def close_game(cfg: dict, timeout: float = 8.0, force: bool = False) -> dict:
+def close_game(cfg: dict, timeout: float = CLOSE_QUIT_WAIT, force: bool = False) -> dict:
     """关闭问道客户端并等待进程退出。
 
-    分三级升级（每级都等进程真的退完再决定要不要升级），因为该客户端实测会忽略 Cmd+Q：
-      1) 正常退出（等同 Cmd+Q，能存档/正常下线），等 `timeout` 秒；
-      2) SIGTERM，等 3 秒；
-      3) SIGKILL 强杀，等 5 秒（来不及存档）。
+    分三级升级（每级都等进程真的退完再决定要不要升级）：
+      1) 正常退出（等同 Cmd+Q，能存档/正常下线），等 `timeout` 秒（默认 CLOSE_QUIT_WAIT）；
+      2) SIGTERM，等 CLOSE_TERM_WAIT 秒；
+      3) SIGKILL 强杀，等 CLOSE_KILL_WAIT 秒（来不及存档）。
+    实测该客户端对前两级都不理会、只有 SIGKILL 生效，所以每级只保留极短等待：
+    给存档留一次机会，但不再为了「优雅」空等十几秒。
     `force=True` 跳过前两级直接强杀。本来就没在跑时返回 already_closed。
     窗口在（含最小化/其他桌面）或进程在都算「在跑」，因为两者可能不同步。
     返回值：closed 已结束的 PID、killed 被强杀的 PID、forced 是否用到了强杀。
@@ -146,30 +161,30 @@ def close_game(cfg: dict, timeout: float = 8.0, force: bool = False) -> dict:
         _log.info("close_game: 未发现运行中的游戏进程，无需关闭")
         return {"ok": True, "already_closed": True, "closed": [], "killed": [],
                 "forced": False, "window": None}
-    _log.info("close_game: 目标进程 %s force=%s timeout=%.0fs", targets, force, timeout)
+    _log.info("close_game: 目标进程 %s force=%s timeout=%.1fs", targets, force, timeout)
 
     if force:
         _log.warning("close_game: force=True，直接 SIGKILL %s（客户端来不及存档）", targets)
         for pid in targets:
             request_quit(pid, stage="kill")
-        still = _wait_exit(targets, 5.0)
+        still = _wait_exit(targets, CLOSE_KILL_WAIT)
         return _close_result(targets, still, killed=targets, forced=True)
 
     for pid in targets:
         request_quit(pid)
     remaining = _wait_exit(targets, timeout)
     if remaining:
-        _log.warning("close_game: %s 未在 %.0fs 内退出，升级 SIGTERM", remaining, timeout)
+        _log.warning("close_game: %s 未在 %.1fs 内退出，升级 SIGTERM", remaining, timeout)
         for pid in remaining:
             request_quit(pid, stage="term")
-        remaining = _wait_exit(remaining, 3.0)
+        remaining = _wait_exit(remaining, CLOSE_TERM_WAIT)
     if not remaining:
         return _close_result(targets, [], killed=[], forced=False)
 
     _log.warning("close_game: %s 仍未退出，升级 SIGKILL", remaining)
     for pid in remaining:
         request_quit(pid, stage="kill")
-    still = _wait_exit(remaining, 5.0)
+    still = _wait_exit(remaining, CLOSE_KILL_WAIT)
     return _close_result(targets, still, killed=remaining, forced=True)
 
 
@@ -186,14 +201,15 @@ def _close_result(targets: list[int], still: list[int], killed: list[int],
             "forced": forced, "window": None}
 
 
-def _wait_exit(pids: list[int], timeout: float) -> list[int]:
+def _wait_exit(pids: list[int], timeout: float, poll: float = CLOSE_POLL) -> list[int]:
     """轮询等待进程退出，返回超时后仍存活的 PID（全退光则为空）。"""
     end = time.time() + timeout
-    while time.time() < end:
+    while True:
         if not alive_pids(pids):
             return []
-        time.sleep(0.5)
-    return alive_pids(pids)
+        if time.time() >= end:
+            return alive_pids(pids)
+        time.sleep(poll)
 
 
 def login(cfg: dict, timeout: float = 120.0, auto_open: bool = True,
@@ -280,27 +296,47 @@ def _wait_ready(ctx: BotContext, cfg: dict, timeout: float,
     """轮询直到登录按钮出现且无加载类文案（判定服务区组已加载完成）。
 
     返回画面里命中的登录按钮文案（「进入游戏」/「登录游戏」），超时返回 None。
-    弹窗会盖住登录按钮，所以等待期间每轮都先尝试确认弹窗。
+    弹窗会盖住登录按钮（按钮文字仍可能被 OCR 读到），所以**有弹窗时一律先关掉**，
+    本轮不判就绪——否则会对着遮罩层点「进入游戏」，点了没反应还以为已点过。
     """
     end = time.time() + timeout
+    stuck = 0
     while time.time() < end:
         results = _ocr(cfg, ctx.grab())
         texts = [r.text for r in results]
+        if _has_dialog(texts):
+            if _confirm_dialog(ctx, results, texts, dialogs):
+                stuck = 0
+            else:
+                stuck += 1
+                if stuck >= DIALOG_STUCK_LIMIT:
+                    _log.warning("login: 提示弹窗连续 %d 轮关不掉，放弃", stuck)
+                    return None
+            time.sleep(0.8)
+            continue
         hits = [b for b in LOGIN_BUTTONS if any(b in t for t in texts)]
         loading = any(any(h in t for h in LOADING_HINTS) for t in texts)
         if hits and not loading:
             return hits[0]
-        _confirm_dialog(ctx, results, texts, dialogs)
         time.sleep(1.0)
     return None
 
 
+def _has_dialog(texts: list[str]) -> bool:
+    """画面里是否有挡路的提示弹窗：确认按钮或已知正文任一命中。"""
+    if any(any(b in t for t in texts) for b in DIALOG_CONFIRM_BUTTONS):
+        return True
+    return any(any(h in t for t in texts) for h in DIALOG_HINTS)
+
+
 def _confirm_dialog(ctx: BotContext, results, texts: list[str],
                     dialogs: list[str] | None = None) -> bool:
-    """画面上有提示弹窗的「确定」类按钮就点掉，返回是否点过。
+    """画面上有提示弹窗就点掉，返回是否点过。
 
     只在登录流程里调用：此时出现「确定/确认/我知道了」基本就是公告或设备风险提示。
     已进主场景（HUD 命中）时不动手，避免误点游戏内的确认框。
+    某个按钮点到上限后换下一个候选（而不是整体放弃）；连按钮文案都认不出时，
+    按正文位置向下偏移兜底点一次，应对 OCR 把「确认」识别成别的字。
     """
     if any(any(h in t for h in MAIN_SCENE_HINTS) for t in texts):
         return False
@@ -308,7 +344,7 @@ def _confirm_dialog(ctx: BotContext, results, texts: list[str],
         if not any(button in t for t in texts):
             continue
         if dialogs is not None and dialogs.count(button) >= DIALOG_MAX_CLICKS:
-            return False
+            continue
         hit = BotContext.find_in(results, button)
         if hit is None:
             continue
@@ -317,8 +353,26 @@ def _confirm_dialog(ctx: BotContext, results, texts: list[str],
         ctx.input.click(hit.cx, hit.cy)
         if dialogs is not None:
             dialogs.append(button)
+        time.sleep(0.6)
         return True
-    return False
+
+    # 兜底：正文命中但按钮认不出，在正文块下方点一次（弹窗按钮通常居中排在文字下面）
+    if dialogs is not None and dialogs.count("fallback") >= DIALOG_MAX_CLICKS:
+        return False
+    body = None
+    for hint in DIALOG_HINTS:
+        hit = BotContext.find_in(results, hint)
+        if hit is not None and (body is None or hit.cy > body.cy):
+            body = hit  # 取最靠下的一句，避免点到标题行
+    if body is None:
+        return False
+    x, y = body.cx, body.cy + DIALOG_FALLBACK_DY
+    _log.info("login: 弹窗按钮文案未识别，按正文兜底点击 (%d,%d)", x, y)
+    ctx.input.click(x, y)
+    if dialogs is not None:
+        dialogs.append("fallback")
+    time.sleep(0.6)
+    return True
 
 
 def _in_main_scene(ctx: BotContext, cfg: dict) -> bool:

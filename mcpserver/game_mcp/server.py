@@ -248,10 +248,11 @@ def open_game() -> dict:
 
 
 @tool
-def close_game(force: bool = False, timeout: float = 8.0) -> dict:
+def close_game(force: bool = False, timeout: float = 2.5) -> dict:
     """关闭问道客户端：先正常退出（可存档），超时后依次升级 SIGTERM / SIGKILL。
 
-    force=True 跳过优雅退出直接强杀（会丢失未保存进度）。
+    该客户端对 Cmd+Q / SIGTERM 都不响应，只有 SIGKILL 生效，故各级等待都很短
+    （默认 2.5s -> 1.5s -> 2s）。force=True 跳过优雅退出直接强杀（会丢失未保存进度）。
     """
     try:
         return game_tools.close_game(cfgmod.load_config(), timeout=timeout, force=force)
