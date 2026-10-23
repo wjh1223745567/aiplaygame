@@ -15,6 +15,13 @@ from ..vision.ocr import OcrResult, find_text, ocr_image, match_text
 from ..vision.llm import Advisor
 from ..vision.template import TemplateMatch, TemplateMatcher
 from ..vision.yolo import YoloDetector
+from .log import get_logger
+
+_log = get_logger("core.engine")
+
+
+def _ms(started: float) -> int:
+    return int((time.perf_counter() - started) * 1000)
 
 
 class BotContext:
@@ -38,11 +45,17 @@ class BotContext:
     # ---------- 感知 ----------
     def grab(self) -> np.ndarray:
         """最新窗口截图。"""
-        return cap.capture_window(self.win)
+        started = time.perf_counter()
+        img = cap.capture_window(self.win)
+        _log.debug("截图 %dx%d %dms", img.shape[1], img.shape[0], _ms(started))
+        return img
 
     def ocr(self, img: Optional[np.ndarray] = None, region=None) -> List[OcrResult]:
-        return ocr_image(img if img is not None else self.grab(),
-                         min_confidence=self.ocr_min_conf, region=region)
+        started = time.perf_counter()
+        results = ocr_image(img if img is not None else self.grab(),
+                            min_confidence=self.ocr_min_conf, region=region)
+        _log.debug("OCR %d 条 %dms region=%s", len(results), _ms(started), region)
+        return results
 
     def find_text(self, keyword: str, img: Optional[np.ndarray] = None,
                   region=None, exact: bool = False) -> Optional[OcrResult]:
@@ -109,7 +122,9 @@ class BotContext:
             hit = self.wait_text(keyword, timeout=timeout) if timeout > 0 \
                 else self.find_text(keyword, region=region)
         if hit is None:
+            _log.debug("未找到文字 %r，放弃点击", keyword)
             return False
+        _log.info("点击文字 %r (%d,%d)", keyword, hit.cx, hit.cy)
         self.input.click(hit.cx, hit.cy)
         return True
 
@@ -117,7 +132,9 @@ class BotContext:
         m = (self.templates.wait_for(self.grab, name, timeout=timeout, **kw)
              if timeout > 0 else self.find_template(name, **kw))
         if m is None:
+            _log.debug("未找到模板 %r，放弃点击", name)
             return False
+        _log.info("点击模板 %r (%d,%d)", name, m.cx, m.cy)
         self.input.click(m.cx, m.cy)
         return True
 
@@ -126,6 +143,9 @@ class BotContext:
         if not self.save_debug:
             return None
         try:
-            return cap.debug_save(self.grab(), tag, self.debug_dir)
-        except Exception:
+            path = cap.debug_save(self.grab(), tag, self.debug_dir)
+            _log.info("保存调试截图 %s", path)
+            return path
+        except Exception as e:
+            _log.warning("保存调试截图失败 tag=%s: %s", tag, e)
             return None

@@ -11,7 +11,7 @@ import java.util.Map;
 
 /**
  * MCP 工具的 Java 薄封装：只保留命令行与状态查询真正调用的类型化方法
- * （ping / list_windows / game_status / login / daily_task / market_scan），
+ * （ping / list_windows / game_status / login / close_game / daily_task / market_scan），
  * 其余工具一律经 {@link #invoke(String, Map)} 按名字调用。
  *
  * <p>所有方法都返回 server 的结构化结果（{@code structuredContent}）；若 server 只返回
@@ -61,6 +61,11 @@ public final class GameTools {
     /** 登录：server 侧先自动检测游戏是否打开，未打开时按 autoOpen 决定是否自动启动。 */
     public Map<String, Object> login(double timeoutSeconds, boolean autoOpen) {
         return call("login", Map.of("timeout", timeoutSeconds, "auto_open", autoOpen));
+    }
+
+    /** 关闭游戏：先正常退出（可存档），超时未退或 force=true 时强制结束。 */
+    public Map<String, Object> closeGame(double timeoutSeconds, boolean force) {
+        return call("close_game", Map.of("timeout", timeoutSeconds, "force", force));
     }
 
     public Map<String, Object> dailyTask(String goal, int maxSteps, boolean dryRun) {

@@ -48,6 +48,10 @@ public class GameService {
         return tools().login(timeoutSeconds, autoOpen);
     }
 
+    public synchronized Map<String, Object> close(double timeoutSeconds, boolean force) {
+        return tools().closeGame(timeoutSeconds, force);
+    }
+
     public synchronized Map<String, Object> daily(String goal, int maxSteps, boolean dryRun) {
         return tools().dailyTask(goal, maxSteps, dryRun);
     }

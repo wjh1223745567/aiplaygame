@@ -52,7 +52,7 @@ public class AiChatService {
     private static final List<String> ACTION_HINTS = List.of(
             "打开", "启动", "登录", "点击", "点一下", "点开", "按一下", "按下", "执行", "操作",
             "帮我一", "帮我", "帮忙", "领一", "做一", "扫货", "日常", "任务", "跑一下",
-            "进入", "关掉", "关闭", "切到前台", "弄到前台", "激活", "试一下", "试试");
+            "进入", "退出", "关掉", "关闭", "切到前台", "弄到前台", "激活", "试一下", "试试");
 
     private static final String SYSTEM_PROMPT = """
             你是「问道」桌面自动化的对话调试助手，运行在 host 层，通过 MCP 客户端调用 mcpserver 的工具。
@@ -64,8 +64,9 @@ public class AiChatService {
             1) 只看不点：询问/诊断类问题（游戏开了吗 / 屏幕上有什么 / 现在什么界面）只用只读工具
                （ping、list_windows、game_status、capture、ocr），在 reply 里按工具实际返回说明，
                不要凭想象回答，也不要自作主张去按键、点屏。
-            2) 谨慎操作：click_point、click_text、press_key、advise、login、daily_task、market_scan
-               是真实操作，只有用户明确要求执行时才调用；open_game 也仅在用户明确说“打开游戏”时用。
+            2) 谨慎操作：click_point、click_text、press_key、advise、login、close_game、daily_task、
+               market_scan 是真实操作，只有用户明确要求执行时才调用；open_game 也仅在用户明确说“打开游戏”时用，
+               close_game 仅在明确说“关闭/退出游戏”时用（force=true 会丢失未保存进度，除非用户要求否则不用）。
                用户只是询问时，给结论和建议即可。
             3) 参数必须符合工具清单里的 JSON Schema；缺信息就先调别的工具查清楚。
             4) 工具返回 ok=false 时，把 error 原样转述给用户，绝不假装成功；
@@ -80,15 +81,17 @@ public class AiChatService {
     private final GameService game;
     private final AiSettings settings;
     private final LlmClient llm;
+    private final DecisionLog decisions;
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
 
     /** 工具清单渲染结果（首次使用时从 MCP listTools 生成后缓存）。 */
     private volatile String toolCatalog;
 
-    public AiChatService(GameService game, AiSettings settings, LlmClient llm) {
+    public AiChatService(GameService game, AiSettings settings, LlmClient llm, DecisionLog decisions) {
         this.game = game;
         this.settings = settings;
         this.llm = llm;
+        this.decisions = decisions;
     }
 
     // ---------- 对外能力 ----------
@@ -107,8 +110,19 @@ public class AiChatService {
         boolean withVision = vision != null ? vision : settings.visionByDefault();
         int rounds = maxSteps > 0 ? maxSteps : settings.maxRounds();
         Session session = sessions.computeIfAbsent(id, Session::new);
+        // 本轮所有模型判断先攒在 turn 里，结束时（含异常）一次性落到 ai-decisions.log
+        TurnLog turn = new TurnLog(id, text, withVision, settings.model(), rounds);
         synchronized (session) {
-            return converse(session, text, withVision, rounds);
+            Map<String, Object> out = null;
+            try {
+                out = converse(session, text, withVision, rounds, turn);
+                return out;
+            } catch (RuntimeException e) {
+                turn.note("异常：" + e);
+                throw e;
+            } finally {
+                decisions.append(turn.render(out));
+            }
         }
     }
 
@@ -136,7 +150,7 @@ public class AiChatService {
     // ---------- 对话主体 ----------
 
     private Map<String, Object> converse(Session session, String userText,
-                                         boolean withVision, int maxRounds) {
+                                         boolean withVision, int maxRounds, TurnLog turn) {
         session.stripImages();
         session.append(userMessage(userText, withVision));
         // 小模型对「只读」约束经常阳奉阴违，所以这里做确定性拦截：
@@ -154,19 +168,25 @@ public class AiChatService {
             payload.addAll(session.snapshot());
 
             String raw;
+            long llmStart = System.currentTimeMillis();
             try {
                 raw = llm.chat(payload);
             } catch (Exception e) {
                 log.warn("AI 调用失败: {}", e.toString());
+                turn.round(round, System.currentTimeMillis() - llmStart, null, null)
+                        .put("note", "模型调用失败：" + e.getMessage());
                 return result(false, "AI 服务调用失败：" + e.getMessage(), steps, round);
             }
+            long llmMs = System.currentTimeMillis() - llmStart;
 
             String answer = raw == null ? "" : raw.trim();
             session.append(Map.of("role", "assistant", "content", answer));
 
             Map<String, Object> plan = extractJson(answer);
+            Map<String, Object> record = turn.round(round, llmMs, answer, plan);
             if (plan == null) {
                 // 模型没按协议输出 JSON：把原文当最终回答，不猜它想调什么
+                record.put("note", "未按协议输出 JSON，原文直接作为回答");
                 return result(true, answer, steps, round);
             }
 
@@ -192,6 +212,8 @@ public class AiChatService {
                 step.put("refused", true);
                 step.put("result", note);
                 steps.add(step);
+                record.put("refused", true);
+                record.put("note", "本轮按只读处理，未执行 " + tool);
                 return result(true, note + "。如果确实要我动手，请明确说「打开游戏」「登录」"
                         + "「帮我做每日」之类。", steps, round);
             }
@@ -217,6 +239,9 @@ public class AiChatService {
             step.put("error", bad);
             step.put("result", rendered);
             steps.add(step);
+            record.put("tool_ms", ms);
+            record.put("tool_ok", !bad);
+            record.put("tool_result", rendered);
 
             session.append(Map.of("role", "user", "content",
                     "【工具结果】" + tool + " -> " + rendered
@@ -431,6 +456,134 @@ public class AiChatService {
         return false;
     }
 
+    // ---------- 判断日志 ----------
+
+    /**
+     * 一轮用户输入里所有模型判断的暂存块，最后整块交给 {@link DecisionLog} 落盘。
+     *
+     * <p>每次模型返回都产生一条 {@code #n} 记录（原始输出 + 解析出的 tool/args/done/reply），
+     * 工具执行后再补上耗时与结果，日志能完整还原「模型怎么想 -> 调了什么 -> 得到什么」。
+     */
+    static final class TurnLog {
+
+        private final String session;
+        private final String user;
+        private final boolean vision;
+        private final String model;
+        private final int maxRounds;
+        private final long startedAt = System.currentTimeMillis();
+        private final List<Map<String, Object>> rounds = new ArrayList<>();
+        private String note = "";
+
+        TurnLog(String session, String user, boolean vision, String model, int maxRounds) {
+            this.session = session;
+            this.user = user;
+            this.vision = vision;
+            this.model = model;
+            this.maxRounds = maxRounds;
+        }
+
+        /** 登记一轮模型调用，返回可继续补充工具结果的记录。 */
+        Map<String, Object> round(int index, long llmMs, String raw, Map<String, Object> plan) {
+            Map<String, Object> record = new LinkedHashMap<>();
+            record.put("round", index);
+            record.put("llm_ms", llmMs);
+            if (plan != null) {
+                record.put("thought", plan.get("thought"));
+                record.put("tool", plan.get("tool"));
+                record.put("args", plan.get("args"));
+                record.put("done", Boolean.TRUE.equals(plan.get("done")));
+                record.put("reply", plan.get("reply"));
+            }
+            record.put("raw", raw == null ? "" : raw);
+            rounds.add(record);
+            return record;
+        }
+
+        void note(String text) {
+            this.note = text == null ? "" : text;
+        }
+
+        /** 渲染成一块可读日志（out 为 null 表示这轮没走到结论）。 */
+        String render(Map<String, Object> out) {
+            StringBuilder sb = new StringBuilder(1024);
+            sb.append(DecisionLog.stamp(startedAt))
+                    .append("  source=host  session=").append(oneLine(session))
+                    .append("  model=").append(oneLine(model))
+                    .append("  vision=").append(vision)
+                    .append("  最多 ").append(maxRounds).append(" 轮\n");
+            sb.append("用户：").append(oneLine(user)).append('\n');
+            for (Map<String, Object> record : rounds) {
+                renderRound(sb, record);
+            }
+            if (out == null) {
+                sb.append("结果：未拿到最终答复");
+                if (!note.isBlank()) {
+                    sb.append("（").append(oneLine(note)).append("）");
+                }
+                sb.append('\n');
+                return sb.toString();
+            }
+            sb.append("结果 ok=").append(out.get("ok"))
+                    .append("  rounds=").append(out.get("rounds"))
+                    .append("  用时 ").append(System.currentTimeMillis() - startedAt).append("ms\n");
+            sb.append("  回复：").append(oneLine(out.get("reply"))).append('\n');
+            if (!note.isBlank()) {
+                sb.append("  备注：").append(oneLine(note)).append('\n');
+            }
+            return sb.toString();
+        }
+
+        private static void renderRound(StringBuilder sb, Map<String, Object> record) {
+            sb.append('#').append(record.get("round"))
+                    .append("  模型 ").append(record.get("llm_ms")).append("ms\n");
+            if (record.containsKey("tool")) {
+                sb.append("  判断 tool=").append(oneLine(record.get("tool")))
+                        .append("  args=").append(oneLine(json(record.get("args"))))
+                        .append("  done=").append(record.get("done")).append('\n');
+                String thought = oneLine(record.get("thought"));
+                if (!thought.isBlank()) {
+                    sb.append("       thought=").append(thought).append('\n');
+                }
+                String reply = oneLine(record.get("reply"));
+                if (!reply.isBlank()) {
+                    sb.append("       reply=").append(reply).append('\n');
+                }
+            }
+            String raw = oneLine(record.get("raw"));
+            if (!raw.isBlank()) {
+                sb.append("  原始 ").append(raw).append('\n');
+            }
+            if (record.containsKey("tool_ms")) {
+                sb.append("  工具 ").append(record.get("tool_ms")).append("ms  ok=")
+                        .append(record.get("tool_ok")).append('\n');
+                sb.append("       结果 ").append(oneLine(record.get("tool_result"))).append('\n');
+            }
+            if (Boolean.TRUE.equals(record.get("refused"))) {
+                sb.append("  拦截 ").append(oneLine(record.get("note"))).append('\n');
+            } else if (record.containsKey("note")) {
+                sb.append("  备注 ").append(oneLine(record.get("note"))).append('\n');
+            }
+        }
+
+        /** 日志一行一事：把换行压平并截断长文本。 */
+        private static String oneLine(Object value) {
+            String s = text(value).replace("\r", "").replace("\n", " / ");
+            return s.length() <= 1200 ? s : s.substring(0, 1200) + "…(已截断)";
+        }
+
+        private static String json(Object value) {
+            if (value == null) {
+                return "{}";
+            }
+            try {
+                return JSON.writeValueAsString(value);
+            } catch (Exception e) {
+                return String.valueOf(value);
+            }
+        }
+    }
+
     // ---------- 会话 ----------
 
     /** 单个对话的上下文。messages 采用 OpenAI 格式（system 每轮现拼）。 */
@@ -444,7 +597,9 @@ public class AiChatService {
         }
 
         void append(Map<String, Object> message) {
-            messages.add(message);
+            // 调用方多用 Map.of 传参（不可变），而 stripImages 要改写历史里的 content，
+            // 所以入历史前统一转成可变副本，避免 UnsupportedOperationException。
+            messages.add(new LinkedHashMap<>(message));
         }
 
         void trim(int max) {
@@ -455,7 +610,8 @@ public class AiChatService {
 
         /** 历史截图统一降级成文字，只保留最新一轮的图。 */
         void stripImages() {
-            for (Map<String, Object> message : messages) {
+            for (int i = 0; i < messages.size(); i++) {
+                Map<String, Object> message = messages.get(i);
                 Object content = message.get("content");
                 if (!(content instanceof List<?> parts)) {
                     continue;
@@ -471,7 +627,10 @@ public class AiChatService {
                     }
                 }
                 if (changed) {
-                    message.put("content", replaced);
+                    // 换一个可变副本回填，兼容历史里可能存在的不可变 Map
+                    Map<String, Object> copy = new LinkedHashMap<>(message);
+                    copy.put("content", replaced);
+                    messages.set(i, copy);
                 }
             }
         }

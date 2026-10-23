@@ -12,13 +12,16 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from typing import Optional
+
+from .core.log import get_logger
 
 # mcpserver/game_mcp/config.py -> mcpserver/ 与项目根（上两级）
 _HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER_DIR = os.path.abspath(os.path.join(_HERE, os.pardir))
 PROJECT_ROOT = os.path.abspath(os.path.join(_HERE, os.pardir, os.pardir))
+
+log = get_logger("config")
 
 _cached: Optional[dict] = None
 
@@ -52,7 +55,9 @@ def load_config(path: Optional[str] = None, reload: bool = False) -> dict:
         return _cached
     cfg_file = config_path(path)
     if not os.path.exists(cfg_file):
+        log.error("配置文件不存在: %s", cfg_file)
         raise FileNotFoundError(f"配置文件不存在: {cfg_file}")
+    log.debug("读取配置 %s", cfg_file)
     with open(cfg_file, "r", encoding="utf-8") as f:
         cfg = json.load(f)
     if not cfg.get("llm"):
@@ -62,8 +67,11 @@ def load_config(path: Optional[str] = None, reload: bool = False) -> dict:
                 with open(llm_file, "r", encoding="utf-8") as f:
                     cfg["llm"] = json.load(f).get("llm", {})
             except (OSError, ValueError) as e:  # json 解析失败也不能让 server 起不来
-                print(f"[config] 读取 {llm_file} 失败，llm 使用默认值: {e}", file=sys.stderr)
+                log.warning("读取 %s 失败，llm 使用默认值: %s", llm_file, e)
+        else:
+            log.warning("%s 不存在，llm 使用默认值", llm_file)
     _cached = cfg
+    log.info("配置加载完成 %s（llm=%s）", cfg_file, "已合并" if cfg.get("llm") else "默认")
     # 让相对路径（assets/debug）相对项目根生效
     try:
         os.chdir(PROJECT_ROOT)

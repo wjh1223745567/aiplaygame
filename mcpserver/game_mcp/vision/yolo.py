@@ -11,6 +11,10 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+from ..core.log import get_logger
+
+_log = get_logger("vision.yolo")
+
 
 @dataclass
 class Detection:
@@ -48,13 +52,14 @@ class YoloDetector:
             import os
             path = self.model_path
             if path and not os.path.exists(path):
-                print(f"[YOLO] 权重 {path} 不存在，回退到 yolo11s.pt 预训练模型")
+                _log.warning("权重 %s 不存在，回退到 yolo11s.pt 预训练模型", path)
                 path = "yolo11s.pt"
             self._model = YOLO(path)
+            _log.info("YOLO 模型已加载 %s", path)
         except Exception as e:  # 依赖未装或权重缺失
             self.enabled = False
             self._load_error = str(e)
-            print(f"[YOLO] 未启用（{e}），跳过动态目标检测")
+            _log.warning("YOLO 未启用（%s），跳过动态目标检测", e)
         return self._model
 
     def detect(self, img: np.ndarray, classes: Optional[List[str]] = None

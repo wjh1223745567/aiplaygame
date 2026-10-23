@@ -13,7 +13,10 @@ from pynput import keyboard as kb
 from pynput.mouse import Button as MouseButton
 from pynput.mouse import Controller as MouseController
 
+from .log import get_logger
 from .window import WindowInfo, ensure_front
+
+_log = get_logger("core.input")
 
 _STOP_FLAG = {"stopped": False}
 _DRY_RUN = {"enabled": False}
@@ -44,13 +47,12 @@ def check_accessibility_or_warn() -> bool:
     """真机执行前自检：无权限时打印醒目提示。返回是否已授权。"""
     if is_dry_run() or has_accessibility():
         return True
-    print("\n" + "=" * 56)
-    print("⚠  未获得 macOS「辅助功能」权限：所有鼠标/键盘操作会被系统静默丢弃")
-    print("   （表现为：点了没反应、快捷键无效、鼠标不动）")
-    print("   解决：系统设置 → 隐私与安全性 → 辅助功能，勾选运行本脚本的 App")
-    print("         （在 IDE 集成终端里运行时，通常需勾选该 IDE，如 Qoder CN IDE）")
-    print("   授权后必须完全退出并重启该 App 才会生效。")
-    print("=" * 56 + "\n")
+    _log.warning(
+        "未获得 macOS「辅助功能」权限：鼠标/键盘操作会被系统静默丢弃"
+        "（点了没反应、快捷键无效、鼠标不动）\n"
+        "  解决：系统设置 → 隐私与安全性 → 辅助功能，勾选运行本脚本的 App"
+        "（IDE 集成终端里运行时通常需勾选该 IDE）\n"
+        "  授权后必须完全退出并重启该 App 才会生效")
     return False
 
 _HOTKEYS = {
@@ -114,7 +116,7 @@ class InputController:
         if is_stopped():
             return
         if is_dry_run():
-            print(f"  [dry-run] click({px:.0f},{py:.0f}, {button})")
+            _log.info("dry-run 点击 (%d,%d) %s", px, py, button)
             return
         self._ensure_front()
         jx = px + random.uniform(-self.offset, self.offset)
@@ -123,12 +125,13 @@ class InputController:
             self.move_to(jx, jy)
         btn = MouseButton.left if button == "left" else MouseButton.right
         self._mouse.click(btn, count=2 if double else 1)
+        _log.info("点击 (%d,%d) %s%s", px, py, button, " 双击" if double else "")
 
     def drag(self, p1: tuple, p2: tuple) -> None:
         if is_stopped():
             return
         if is_dry_run():
-            print(f"  [dry-run] drag({p1} -> {p2})")
+            _log.info("dry-run 拖拽 (%d,%d) -> (%d,%d)", *p1, *p2)
             return
         self.move_to(*p1)
         self._mouse.press(MouseButton.left)
@@ -138,21 +141,24 @@ class InputController:
         self.move_to(*p2)
         time.sleep(random.uniform(0.05, 0.15))
         self._mouse.release(MouseButton.left)
+        _log.info("拖拽 (%d,%d) -> (%d,%d)", *p1, *p2)
 
     # ---------- 键盘 ----------
     def press_key(self, key: str) -> None:
         if is_stopped():
             return
         if is_dry_run():
-            print(f"  [dry-run] key({key})")
+            _log.info("dry-run 按键 %s", key)
             return
         self._ensure_front()
         k = _HOTKEYS.get(key.lower())
         if k is None and len(key) == 1:
             k = key.lower()
         if k is None:
+            _log.warning("按键 %r 不支持，已忽略", key)
             return
         self._tap(k)
+        _log.info("按键 %s", key)
 
     def press_enter(self) -> None:
         self._tap(kb.Key.enter)
@@ -168,7 +174,7 @@ class InputController:
         if is_stopped():
             return
         if is_dry_run():
-            print(f"  [dry-run] hotkey{keys}")
+            _log.info("dry-run 组合键 %s", "+".join(keys))
             return
         self._ensure_front()
         mapped = []
@@ -189,13 +195,14 @@ class InputController:
             controller.press(k)
         for k in reversed(mapped):
             controller.release(k)
+        _log.info("组合键 %s", "+".join(keys))
 
     def type_text(self, text: str) -> None:
         """逐字符输入（ASCII 可靠；中文建议先走剪贴板 paste）。"""
         if is_stopped():
             return
         if is_dry_run():
-            print(f"  [dry-run] type({text!r})")
+            _log.info("dry-run 输入 %r", text)
             return
         controller = self._keyboard()
         for ch in text:
@@ -220,6 +227,7 @@ class InputController:
     def _tap(self, key) -> None:
         kb.Controller().tap(key)
         self.human_delay(scale=0.4)
+        _log.debug("tap %s", key)
 
 
 # ---------- 全局急停 ----------
@@ -247,4 +255,4 @@ def start_stop_listener(hotkey: str = "f12") -> Optional[kb.GlobalHotKeys]:
 
 def _on_stop() -> None:
     _STOP_FLAG["stopped"] = True
-    print("\n[输入控制] 检测到急停热键，自动化已停止")
+    _log.warning("检测到急停热键，自动化已停止")

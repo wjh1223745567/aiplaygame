@@ -1,12 +1,18 @@
 """macOS 窗口枚举与定位（基于 Quartz / Cocoa，无需额外权限即可列出窗口）。"""
 from __future__ import annotations
 
+import os
 import re
+import signal
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import Quartz
 from AppKit import NSRunningApplication, NSScreen, NSWorkspace
+
+from .log import get_logger
+
+_log = get_logger("core.window")
 
 
 @dataclass
@@ -104,7 +110,8 @@ def find_game_window(title_keywords: List[str], exclude_keywords: Optional[List[
     """
     exclude_keywords = exclude_keywords or []
     candidates = []
-    for w in list_windows(include_offscreen=include_offscreen):
+    windows = list_windows(include_offscreen=include_offscreen)
+    for w in windows:
         text = f"{w.owner} {w.title}"
         if not any(k and k in text for k in title_keywords):
             continue
@@ -114,9 +121,12 @@ def find_game_window(title_keywords: List[str], exclude_keywords: Optional[List[
             continue
         candidates.append(w)
     if not candidates:
+        _log.debug("未匹配到游戏窗口 关键词=%s include_offscreen=%s 枚举到 %d 个窗口",
+                   title_keywords, include_offscreen, len(windows))
         return None
     # 若窗口无标题（部分客户端不设置 kCGWindowName），优先按属主进程名匹配
     best = max(candidates, key=lambda c: c.width * c.height)
+    _log.debug("匹配到游戏窗口 %s（候选 %d 个）", best, len(candidates))
     return best
 
 
@@ -146,11 +156,82 @@ def activate_window(win: WindowInfo) -> bool:
             return is_game_frontmost(win)
         ra = NSRunningApplication.runningApplicationWithProcessIdentifier_(win.pid)
         if ra is None:
+            _log.debug("PID %d 无对应 NSRunningApplication，无法激活 %s", win.pid, win.owner)
             return False
         # NSApplicationActivateIgnoringOtherApps = 1<<1（macOS 13 上可抢占前台）
-        return bool(ra.activateWithOptions_(1 << 1))
-    except Exception:  # noqa: BLE001
+        ok = bool(ra.activateWithOptions_(1 << 1))
+        _log.debug("激活窗口 pid=%d owner=%s -> %s", win.pid, win.owner, ok)
+        return ok
+    except Exception as e:  # noqa: BLE001
+        _log.warning("激活窗口 %s 异常: %s", win.owner, e)
         return False
+
+
+def request_quit(pid: int, stage: str = "quit") -> bool:
+    """请求某个进程退出，stage 决定力度：
+
+    quit（默认）走 NSRunningApplication.terminate()，等同 Cmd+Q，客户端能存档/正常下线；
+    terminate 不可用（非 GUI 主进程、返回值 False）时退化为 SIGTERM。
+    term 发 SIGTERM（进程默认处理就是退出，游戏很少拦截）。
+    kill 发 SIGKILL，立即结束、客户端来不及存档。
+    返回是否成功发出请求（不代表进程已退出，需配合轮询）。
+    """
+    if not (pid and pid > 0):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        _log.debug("PID %d 已不存在，无需退出", pid)
+        return True  # 已经没了
+    except Exception as e:  # noqa: BLE001
+        _log.warning("探测 PID %d 存活失败: %s", pid, e)
+        return False
+    if stage == "kill":
+        try:
+            os.kill(pid, signal.SIGKILL)
+            _log.info("已发送 SIGKILL pid=%d", pid)
+            return True
+        except Exception as e:  # noqa: BLE001
+            _log.warning("发送 SIGKILL 失败 pid=%d: %s", pid, e)
+            return False
+    if stage == "term":
+        try:
+            os.kill(pid, signal.SIGTERM)
+            _log.info("已发送 SIGTERM pid=%d", pid)
+            return True
+        except Exception as e:  # noqa: BLE001
+            _log.warning("发送 SIGTERM 失败 pid=%d: %s", pid, e)
+            return False
+    try:
+        ra = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+        if ra is not None and bool(ra.terminate()):
+            _log.info("已请求正常退出（等同 Cmd+Q）pid=%d", pid)
+            return True
+    except Exception as e:  # noqa: BLE001
+        _log.debug("terminate() 不可用 pid=%d: %s", pid, e)
+    try:
+        os.kill(pid, signal.SIGTERM)
+        _log.info("正常退出请求不可用，改发 SIGTERM pid=%d", pid)
+        return True
+    except Exception as e:  # noqa: BLE001
+        _log.warning("退出请求全部失败 pid=%d: %s", pid, e)
+        return False
+
+
+def alive_pids(pids: List[int]) -> List[int]:
+    """过滤出仍然存活的 PID（os.kill(pid,0) 探活，不发送信号）。"""
+    alive: List[int] = []
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+            alive.append(pid)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            alive.append(pid)
+        except Exception:  # noqa: BLE001
+            continue
+    return alive
 
 
 def ensure_front(win: WindowInfo, timeout: float = 1.2, poll: float = 0.05) -> bool:
@@ -162,6 +243,7 @@ def ensure_front(win: WindowInfo, timeout: float = 1.2, poll: float = 0.05) -> b
     import time
     if is_game_frontmost(win):
         return True
+    _log.debug("窗口不在前台，尝试激活 %s", win.owner)
     deadline = time.time() + timeout
     while time.time() < deadline:
         activate_window(win)
@@ -170,4 +252,7 @@ def ensure_front(win: WindowInfo, timeout: float = 1.2, poll: float = 0.05) -> b
             if is_game_frontmost(win):
                 return True
             time.sleep(poll)
-    return is_game_frontmost(win)
+    front = is_game_frontmost(win)
+    if not front:
+        _log.warning("无法把窗口切到前台（后续输入可能落不到游戏）: %s", win)
+    return front

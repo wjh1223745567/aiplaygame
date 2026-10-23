@@ -27,12 +27,18 @@ import base64
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from typing import List, Optional
 
 import cv2
 import numpy as np
+
+from ..core import decision_log
+from ..core.log import get_logger
+
+_log = get_logger("vision.llm")
 
 # 智谱开放平台 OpenAI 兼容端点（GLM-4V-Flash 永久免费）
 DEFAULT_BASE = "https://open.bigmodel.cn/api/paas/v4"
@@ -165,6 +171,7 @@ class Advisor:
     # ---------- 底层调用 ----------
     def _chat(self, user_text: str, img: Optional[np.ndarray]) -> str:
         if not self.api_key:
+            _log.warning("未配置 llm.api_key（或环境变量 LLM_API_KEY），大模型决策不可用")
             raise LlmError("未配置 llm.api_key（或环境变量 LLM_API_KEY）")
         content: List[dict] = [{"type": "text", "text": user_text}]
         if img is not None:
@@ -199,19 +206,26 @@ class Advisor:
                 detail = e.read().decode("utf-8", "ignore")[:300]
             except Exception:  # noqa: BLE001
                 pass
+            _log.error("大模型 HTTP %d 失败 model=%s: %s", e.code, self.model, detail)
             raise LlmError(f"HTTP {e.code} 调用失败: {detail}") from e
         except urllib.error.URLError as e:
+            _log.error("大模型网络错误 model=%s: %s", self.model, e.reason)
             raise LlmError(f"网络错误: {e.reason}") from e
         try:
-            return body["choices"][0]["message"]["content"]
+            text = body["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
+            _log.error("大模型返回结构异常 model=%s: %s", self.model, json.dumps(body)[:300])
             raise LlmError(f"返回结构异常: {json.dumps(body)[:300]}") from None
+        _log.debug("大模型调用完成 model=%s 图片=%s 返回 %d 字",
+                   self.model, img is not None, len(text or ""))
+        return text
 
     # ---------- 业务封装 ----------
     def choose(self, img: np.ndarray, candidates: List[dict], goal: str = "") -> dict:
         """先标注后决策：把已编号的 candidates 交给模型，返回它选中的 id。
 
         返回 dict：{scene, reason, choose:[合法id], other, done}。坐标不经模型。
+        每次调用都把「模型原始输出 + 判断结果」写进项目根的 ai-decisions.log（source=mcpserver）。
         """
         user = (
             f"目标：{goal or '推进当前任务'}\n\n"
@@ -219,9 +233,26 @@ class Advisor:
             f"{_candidates_hint(candidates) or '（无可操作项）'}\n\n"
             "请返回JSON。"
         )
-        raw = self._chat(user, img)
+        started = time.time()
+        lines = [
+            f"{decision_log.stamp()}  source=mcpserver  model={self.model}"
+            f"  候选 {len(candidates)} 项",
+            f"目标：{decision_log.one_line(goal or '推进当前任务')}",
+        ]
+        try:
+            raw = self._chat(user, img)
+        except LlmError as e:
+            cost = int((time.time() - started) * 1000)
+            _log.warning("大模型选择失败 %dms 候选 %d 项: %s", cost, len(candidates), e)
+            lines.append(f"调用失败 {cost}ms：{decision_log.one_line(e)}")
+            decision_log.write(lines)
+            raise
+        cost = int((time.time() - started) * 1000)
         data = _extract_json(raw)
+        lines.append(f"模型 {cost}ms  parsed={data is not None}")
         if data is None:
+            lines.append(f"原始 {decision_log.one_line(raw, 800)}")
+            decision_log.write(lines)
             return {"scene": "other", "reason": f"模型未返回可解析JSON: {raw[:120]}",
                     "choose": [], "done": False, "_raw": raw}
         valid = {c["id"] for c in candidates}
@@ -237,6 +268,13 @@ class Advisor:
         data.setdefault("scene", "other")
         data.setdefault("reason", "")
         data.setdefault("done", False)
+        # 判断结论：场景、是否收工、选中项（带回填文字）与理由，足够还原一次决策
+        picked = [f"[{c['id']}]{c['text']}" for c in candidates if c["id"] in ids]
+        lines.append(f"判断 scene={data['scene']}  done={data['done']}  "
+                     f"选 {picked or '无'}  other={decision_log.one_line(data.get('other'))}")
+        lines.append(f"理由 {decision_log.one_line(data.get('reason'))}")
+        lines.append(f"原始 {decision_log.one_line(raw, 800)}")
+        decision_log.write(lines)
         return data
 
     def advise(self, img: np.ndarray, results, goal: str) -> dict:
@@ -350,8 +388,8 @@ def run_advisor_loop(ctx, goal: str = "", max_steps: int = 120,
             last_key, last_texts = trail[-1]
             if last_texts:
                 tried_by_screen.setdefault(last_key, set()).update(last_texts)
-                print(f"[大模型] 检测到绕圈：回到已访问画面，暂避上一步选项 "
-                      f"{list(last_texts)}，下次在该画面改选下一个（不永久排除）")
+                _log.info("检测到绕圈：回到已访问画面，暂避上一步选项 %s（下次改选下一个，不永久排除）",
+                          list(last_texts))
                 del trail[:prev_keys.index(key) + 1]
         tried = tried_by_screen.get(key, set())
         advance = [c for c in cands if c["text"] not in tried]
@@ -368,14 +406,14 @@ def run_advisor_loop(ctx, goal: str = "", max_steps: int = 120,
         try:
             plan = ctx.advisor.choose(img, advance, goal + task_ctx)
         except LlmError as e:
-            print(f"[大模型] 调用失败，结束循环：{e}")
+            _log.error("大模型调用失败，结束循环: %s", e)
             break
         picked = [cmap_find(advance, i) for i in plan.get("choose") or []]
         picked_txt = [f"[{c['id']}]{c['text']}" for c in picked if c]
-        print(f"[大模型#{steps}] scene={plan.get('scene')} done={plan.get('done')} "
-              f":: {plan.get('reason')} :: 选 {picked_txt or plan.get('other') or '无'}")
+        _log.info("大模型#%d scene=%s done=%s :: %s :: 选 %s", steps, plan.get("scene"),
+                  plan.get("done"), plan.get("reason"), picked_txt or plan.get("other") or "无")
         if plan.get("done"):
-            print("[大模型] 目标已达成，结束循环")
+            _log.info("大模型目标已达成，结束循环（%d 轮）", steps)
             break
         clicked_texts = [c["text"] for c in picked if c]
         executed = execute_choice(ctx, advance, plan)
@@ -390,7 +428,7 @@ def run_advisor_loop(ctx, goal: str = "", max_steps: int = 120,
             idle += 1
             time.sleep(idle_pause)
             if idle >= idle_limit:
-                print("[大模型] 连续多轮无可执行动作（可能已无事可做/需人工），结束循环")
+                _log.warning("连续 %d 轮无可执行动作（可能已无事可做/需人工），结束循环", idle)
                 break
     return steps
 
