@@ -8,6 +8,7 @@
 #   bash scripts/docker-host.sh status     # 容器状态与健康
 #   bash scripts/docker-host.sh down
 #   bash scripts/docker-host.sh save-base  # 把基础镜像导出成离线 tar（见下）
+#   bash scripts/docker-host.sh prune      # 回收悬空 <none> 镜像 + 给构建缓存封顶
 #
 # 为什么要这个脚本：Docker Hub 在国内常连不通，而 `docker compose build` 在基础镜像
 # 不在本地时会安静地卡在 pull 重试上几十分钟，表现得就像「打包很慢」。这里先把基础
@@ -22,6 +23,10 @@ JAR="$ROOT/host/target/host.jar"
 BASE_IMAGE="${HOST_BASE_IMAGE:-eclipse-temurin:21-jre}"
 BASE_TAR="$ROOT/.tools/docker-base-jre21.tar"
 PULL_TIMEOUT="${DOCKER_PULL_TIMEOUT:-240}"
+# 与 docker-compose.yml 里的 image 保持一致；构建后旧 ID 变悬空，靠它定位回收
+IMAGE_REF="${HOST_IMAGE_REF:-autogame-host:0.1.0}"
+# 构建缓存上限（超了才裁，保留最近用到的）；设 0 表示完全不清缓存
+CACHE_MAX="${DOCKER_CACHE_MAX:-512MB}"
 # 直连 Docker Hub 基本不通，国内源优先；镜像名要带 library/ 前缀
 MIRRORS=(
   "docker.1ms.run/library/eclipse-temurin:21-jre"
@@ -86,6 +91,37 @@ EOF
   return 1
 }
 
+short_id() { local s="${1#sha256:}"; printf '%s' "${s:0:12}"; }
+
+gc_superseded_image() {
+  # 每次发布：COPY 进去的 host.jar 都是新文件 → 新层 → 新 image ID，tag 跟到新 ID，
+  # 旧 ID 就成了 <none> 悬空镜像。攒着不删就是「发布几次 docker images 一堆废镜像」。
+  # 只删「被本次构建取代的那一个旧 ID」，不用 docker image prune -a——那会把
+  # neo4j/mysql/redis 这些当前没起容器的有 tag 镜像也当垃圾删掉。
+  local old="$1" new
+  new="$(docker image inspect -f '{{.Id}}' "$IMAGE_REF" 2>/dev/null || true)"
+  if [ -z "$old" ] || [ -z "$new" ] || [ "$old" = "$new" ]; then
+    return 0        # 没有旧镜像，或构建命中缓存（ID 未变）
+  fi
+  if ! docker image inspect "$old" >/dev/null 2>&1; then
+    return 0        # 已经不在了（被手工 prune 过），不是异常
+  fi
+  if docker rmi "$old" >/dev/null 2>&1; then
+    log "已回收被取代的旧镜像 $(short_id "$old")"
+  else
+    log "旧镜像 $(short_id "$old") 仍被容器占用，本次跳过（容器重建后即可回收）"
+  fi
+}
+
+trim_build_cache() {
+  # BuildKit 缓存只增不减；本项目的构建不到 1 秒，裁掉陈旧缓存不影响速度。
+  # 新版 buildx 这个参数叫 --max-used-space，旧版叫 --keep-storage，两个都试。
+  [ "$CACHE_MAX" = "0" ] && return 0
+  docker buildx prune -f --max-used-space "$CACHE_MAX" >/dev/null 2>&1 \
+    || docker buildx prune -f --keep-storage "$CACHE_MAX" >/dev/null 2>&1 \
+    || log "构建缓存清理跳过（buildx 参数不兼容）"
+}
+
 warn_mcpserver() {
   if ! lsof -nP -iTCP:18090 -sTCP:LISTEN >/dev/null 2>&1; then
     log "提示：宿主机 18090 没有监听，容器里的 host 会连不到 mcpserver。"
@@ -103,7 +139,10 @@ case "$ACTION" in
   build)
     ensure_jar
     ensure_base_image
+    prev="$(docker image inspect -f '{{.Id}}' "$IMAGE_REF" 2>/dev/null || true)"
     docker compose build
+    gc_superseded_image "$prev"
+    trim_build_cache
     ;;
   restart)
     # config.json 是挂载进容器的，只在启动时读一次：改完必须重建容器进程。
@@ -123,12 +162,32 @@ case "$ACTION" in
   down)
     docker compose down
     ;;
+  prune)
+    # 只清 <none>（无 tag）镜像：有 tag 的一律不动，被容器占用的删不掉就跳过
+    n=0
+    kept=0
+    for id in $(docker images -f dangling=true -q | sort -u); do
+      n=$((n + 1))
+      if docker rmi "$id" >/dev/null 2>&1; then
+        log "已回收悬空镜像 $(short_id "$id")"
+      else
+        kept=$((kept + 1))
+      fi
+    done
+    log "悬空镜像 ${n} 个，回收 $((n - kept)) 个，仍被容器占用 ${kept} 个"
+    trim_build_cache
+    docker system df
+    ;;
   up)
     ensure_jar
     ensure_base_image
     warn_mcpserver
+    prev="$(docker image inspect -f '{{.Id}}' "$IMAGE_REF" 2>/dev/null || true)"
     docker compose build
     docker compose up -d
+    # 先 up 再回收：旧容器还在跑时旧镜像删不掉，重建完就成了纯垃圾
+    gc_superseded_image "$prev"
+    trim_build_cache
     log "等待容器健康..."
     for _ in $(seq 1 40); do
       st="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
@@ -149,7 +208,7 @@ case "$ACTION" in
     exit 1
     ;;
   *)
-    log "未知动作：${ACTION}（可用：up build restart logs status down save-base）"
+    log "未知动作：${ACTION}（可用：up build restart logs status down save-base prune）"
     exit 2
     ;;
 esac
