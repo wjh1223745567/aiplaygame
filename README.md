@@ -308,12 +308,17 @@ macOS 侧仍可用终端版对话框：`bash scripts/run-chat.sh`（`chat.jar`�
   `scripts/crop_template.py --box x1,y1,x2,y2 --name close_x` 从 `debug/` 截图裁出模板并
   直接打印该往配置里加的那一行。模板项不单独声明「是否可点」，统一由 `kind` 决定。
   YOLO 只做区域分类、不区分「保存还是取消」（语义由区内 OCR 给出），推荐权重
-  `assets/models/uitag-yolo11s-ui-detect-v1.pt`（YOLO11s 微调、桌面截图 9 类，含 Button）。
+  `assets/models/yolo-ui.pt`（YOLO11s 在 GroundCUA 上微调，桌面截图 9 类，含 Button）。
+  取权重不必走 HF（仓库 gated、要 token）：它随 `uitag` PyPI 包一起分发，
+  `uv pip install --no-deps --target /tmp/u uitag` 后把 `uitag/models/yolo-ui.pt` 拷过来即可，
+  不用装它那一堆 mlx-vlm / transformers 依赖。文件名就叫 `yolo-ui.pt`，别按仓库名重命名；
+  权重是 640×640 tile 训练的，`yolo.imgsz` 必须留 640（给 1280 反而掉召回，实测最高 conf 0.71 → 0.31）。
   模型类别名（`Button` / `Icon` / `Text` …）与内部 kind 不是一回事，检测后先查
   `yolo.class_map` 再查内置 `CLASS_MAP` 归一化成 button/icon/label/dialog/info/task；
   未收录的类别降成 `info`（只读锚点，不会被点）并且只 warning 一次——按提示补一行
   `"class_map": {"Checkbox": "button"}` 就能改正，换模型不用改代码。
-  `yolo.imgsz` 默认 1280：UI 元素普遍很小，640 会把 25px 的按钮缩成 10px、召回明显掉。
+  `yolo.imgsz` 默认 640：UI 层权重是在 640×640 tile 上训练的，推理用 640 才匹配
+  训练分布（给 1280 反而掉召回：同一张截图最高 conf 0.71 → 0.31，且慢一倍多）。
   权重缺失时该层直接禁用并记 `_load_error`、**不回退 COCO**
   （COCO 的 person/car 当 UI 用只会坑下游），除非显式设 `yolo.allow_pretrained_fallback=true`。
   面积超过整图 35% 的框一律当容器：不参与可点、也不认领框内文字，

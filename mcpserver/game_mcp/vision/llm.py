@@ -46,7 +46,7 @@ DEFAULT_MODEL = "glm-4v-flash"
 
 SYSTEM_PROMPT = (
     "你是问道的老玩家兼自动决策器。你会收到：当前游戏截图 + 我方用「模板匹配 / YOLO 区域分类 / OCR」"
-    "三层融合定位好的文字，分成【可点击项】(带编号 id) 与【画面其他信息】(只读)两部分。"
+    "多路视觉融合定位好的文字，分成【可点击项】(带编号 id) 与【画面其他信息】(只读) 两部分。"
     "请按「正常游戏策略」从可点击项里选出应点击的 id(可多选、按点击顺序)。"
     "\n【候选】只给可点击项编号，你只能从中选 id；画面其他信息单独列出，只作判断依据，不要试图点击；"
     "也不得发明清单以外的文字。坐标由我方按 id 回填，你绝不输出坐标；只输出一个JSON对象，无多余文字或代码围栏。"
@@ -57,9 +57,9 @@ SYSTEM_PROMPT = (
     "\n【正常游戏策略】"
     "\n1) 通用：始终朝「当前任务线索」推进，优先选最贴合目标、推进步数最少的项；同一次不要选多个相互冲突的项。"
     "\n2) 主场景：优先点「任务追踪」里师门任务等目标行(会自动寻路/交互，此类行若出现在可点击项里才可点，否则按其他信息的文字线索判断)；若有「领取/签到/奖励」等可领项先领取；不要打开无关面板。"
-    "\n3) 对话：选能推进剧情的选项——优先与任务目标对应的NPC/给予/继续/前进/确定/传送；绝不选 放弃/取消/拒绝/不接/离开/下次再说。"
-    "\n4) 战斗：优先选「自动/自动战斗」挂机；否则攻击与任务相关的怪/主怪；不要点 逃跑/防御/无关技能；战斗结束后清理奖励弹窗。"
-    "\n5) 面板/弹窗：领完奖励后关闭(点 关闭/确定)；不在无关界面久留。"
+    "\n3) 对话：选能推进剧情的选项——优先与任务目标对应的NPC/给予/继续/前进/确定/传送；绝不选放弃/取消/拒绝/不接/离开/下次再说。"
+    "\n4) 战斗：优先选「自动/自动战斗」挂机；否则攻击与任务相关的怪/主怪；不要点逃跑/防御/无关技能；战斗结束后清理奖励弹窗。"
+    "\n5) 面板/弹窗：领完奖励后关闭(点关闭/确定)；不在无关界面久留。"
     "\n6) 加载/过场：choose给空数组并用 other.wait，或等待画面稳定。"
     "\n7) 反循环：若提示某些选项已反复点击无效，绝不要再选它们，改选其他能真正推进任务的不同选项。"
 )
@@ -359,73 +359,15 @@ class Advisor:
         data["context"] = context
         return data
 
-    def decide_dialog(self, img: np.ndarray, regions, hint: str = "") -> Optional[dict]:
-        """对话专用（区域分流后选择）：返回我方区域清单中真实存在的选项，供安全点击。"""
-        cands, context = build_candidates(regions, self.clickable_kinds, self.empty_fallback)
-        try:
-            data = self.choose(img, cands, hint or "推进对话/任务", context=context)
-        except LlmError:
-            return None
-        cmap = {c["id"]: c for c in cands}
-        for cid in data.get("choose") or []:
-            c = cmap.get(cid)
-            if c:
-                # 用我方区域坐标点击：模板命中中心比「按文字重新 OCR 一次」更稳
-                return {"action": "click_point", "x": c["x"], "y": c["y"]}
-        return None
-
-
-# ---------- 动作执行器 ----------
-def _norm_to_px(v: float) -> float:
-    """模型给的归一化坐标(0~1)容错：<=1.5 视为归一化, 否则当作已给像素(交回原值)。"""
-    return v
-
-
-def execute_actions(ctx, actions: List[dict], img_shape) -> int:
-    """执行模型推荐的 actions，返回实际执行的动作数。
-
-    ctx 为 BotContext：click_text 走 OCR 精确命中, click_point 走归一化坐标。
-    """
-    from ..core import input as user_input  # 延迟导入避免环依赖
-    h, w = img_shape[:2]
-    executed = 0
-    for act in actions or []:
-        if user_input.is_stopped():
-            break
-        kind = (act.get("action") or "").lower()
-        if kind == "click_text":
-            text = (act.get("text") or "").strip()
-            if not text:
-                continue
-            if ctx.click_text(text, timeout=0):
-                executed += 1
-        elif kind == "click_point":
-            x = float(act.get("x", 0.5))
-            y = float(act.get("y", 0.5))
-            px = x * w if x <= 1.5 else x
-            py = y * h if y <= 1.5 else y
-            ctx.input.click(px, py)
-            executed += 1
-        elif kind == "press":
-            key = (act.get("key") or "").strip()
-            if key:
-                ctx.input.press_key(key)
-                executed += 1
-        elif kind == "wait":
-            import time
-            time.sleep(max(0.0, min(float(act.get("sec", 1)), 10.0)))
-    return executed
-
-
+# ---------- 连续决策循环 ----------
 def run_advisor_loop(ctx, goal: str = "", max_steps: int = 120,
                      idle_limit: int = 4, step_pause: Optional[float] = None) -> int:
     """纯「识别 → 大模型决策 → 执行」连续循环（先标注后决策）：
-      每轮 snapshot -> ctx.analyze 三层融合出区域 -> build_candidates 分流可点/只读
+      每轮 snapshot -> ctx.analyze 四层融合出区域 -> build_candidates 分流可点/只读
       -> advisor.choose 只从可点项选 id -> execute_choice 用我方坐标回填点击。
     直到 done / 连续无动作 / 达到 max_steps / 被急停。返回实际轮数。
     节奏参数（step_pause / idle_pause / click_pause）由 config.timing 控制，默认已调快。
     """
-    import time
     from ..core import input as user_input
     default_goal = "持续推进并完成当前可做的游戏任务（优先右侧任务追踪的目标）"
     goal = goal or default_goal
@@ -461,7 +403,7 @@ def run_advisor_loop(ctx, goal: str = "", max_steps: int = 120,
         gen = ctx.guard_generation()
         steps += 1
         img, results = ctx.snapshot()
-        # 三层融合（模板 → YOLO → OCR）后再分流：只有 button 类区域带 id 可点，其余只读
+        # 四层融合（模板 → UITag → 通用 → OCR）后再分流：只有 button 类区域带 id 可点， 其余只读
         regions = ctx.analyze(img, results)
         clickable, context = build_candidates(regions, ctx.advisor.clickable_kinds,
                                              ctx.advisor.empty_fallback)
@@ -534,7 +476,6 @@ def execute_choice(ctx, candidates: List[dict], plan: dict,
     generation 不为 None 时，每次点击前比对一次：不一致说明期间被人工接管，
     暂停前算出的坐标已不属于当前画面，立即中止剩余动作。
     """
-    import time
     from ..core import input as user_input
     cmap = {c["id"]: c for c in candidates}
     executed = 0

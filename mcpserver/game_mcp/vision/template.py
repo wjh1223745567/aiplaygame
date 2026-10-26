@@ -6,12 +6,34 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
-from functools import lru_cache
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+# 模板图缓存：key 为绝对路径，值为 (mtime_ns, 彩色图, 灰度图)。
+# 必须放模块级：之前用 @lru_cache 装饰实例方法，self 参与缓存 key，而每个工具调用都会
+# 新建一个 TemplateMatcher —— 缓存一次都不会命中，且 lru_cache 永久持有旧实例与模板图。
+_TPL_CACHE: Dict[str, Tuple[int, np.ndarray, np.ndarray]] = {}
+
+
+def _load_template(path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """读模板图 (color, gray)，按路径 + mtime 缓存；文件改过后自动重读。"""
+    try:
+        stamp = os.stat(path).st_mtime_ns
+    except OSError:
+        stamp = 0
+    hit = _TPL_CACHE.get(path)
+    if hit is not None and hit[0] == stamp:
+        return hit[1], hit[2]
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise FileNotFoundError(f"模板不存在: {path}")
+    entry = (stamp, img, cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+    _TPL_CACHE[path] = entry
+    return entry[1], entry[2]
 
 
 @dataclass
@@ -41,17 +63,11 @@ class TemplateMatcher:
         self.multi_scale = bool(multi_scale)
         os.makedirs(templates_dir, exist_ok=True)
 
-    @lru_cache(maxsize=64)
-    def _load(self, name: str) -> np.ndarray:
+    def _path(self, name: str) -> str:
         path = name if os.path.isabs(name) else os.path.join(self.templates_dir, name)
         if not path.endswith((".png", ".jpg", ".jpeg", ".bmp")):
             path += ".png"
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"模板不存在: {path}")
-        img = cv2.imread(path, cv2.IMREAD_COLOR)
-        if img is None:
-            raise FileNotFoundError(f"模板不存在: {path}")
-        return img
+        return path
 
     def find(self, img: np.ndarray, template: str,
              threshold: Optional[float] = None,
@@ -79,10 +95,11 @@ class TemplateMatcher:
             search = img[y1:y2, x1:x2]
 
         if isinstance(template, np.ndarray):
-            tpl = template
+            tpl_color = template
+            tpl_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
         else:
             try:
-                tpl = self._load(template)
+                tpl_color, tpl_gray = _load_template(self._path(template))
             except FileNotFoundError:
                 # 备用模板尚未标定属正常情况：视为未匹配，不中断 OCR 主流程
                 return []
@@ -95,8 +112,10 @@ class TemplateMatcher:
         best: List[TemplateMatch] = []
         gray = cv2.cvtColor(search, cv2.COLOR_BGR2GRAY)
         for s in scales:
-            t = cv2.resize(tpl, None, fx=s, fy=s) if s != 1.0 else tpl
-            tg = cv2.cvtColor(t, cv2.COLOR_BGR2GRAY)
+            if s == 1.0:
+                tg = tpl_gray
+            else:
+                tg = cv2.cvtColor(cv2.resize(tpl_color, None, fx=s, fy=s), cv2.COLOR_BGR2GRAY)
             th, tw = tg.shape[:2]
             if th > gray.shape[0] or tw > gray.shape[1] or th < 4 or tw < 4:
                 continue
@@ -144,7 +163,6 @@ class TemplateMatcher:
     def wait_for(self, img_provider, template: str, timeout: float = 10.0,
                  interval: float = 0.5, **kw) -> Optional[TemplateMatch]:
         """轮询直到模板出现或超时。img_provider 为无参函数，返回最新截图。"""
-        import time
         end = time.time() + timeout
         while time.time() < end:
             m = self.find(img_provider(), template, **kw)

@@ -15,7 +15,7 @@ from ..core.window import WindowInfo
 from ..vision.ocr import OcrResult, find_text, ocr_image, match_text
 from ..vision.llm import Advisor
 from ..vision.screen import Region, analyze_regions
-from ..vision.template import TemplateMatch, TemplateMatcher
+from ..vision.template import TemplateMatcher
 from ..vision.yolo import YoloDetector
 from .log import get_logger
 
@@ -45,7 +45,6 @@ class BotContext:
         self.general = YoloDetector({**(cfg.get("general", {}) or {}), "layer": "general"})
         self.ocr_min_conf = cfg.get("ocr", {}).get("min_confidence", 0.5)
         self.debug_dir = cfg.get("capture", {}).get("debug_dir", "debug")
-        self.save_debug = cfg.get("capture", {}).get("save_debug", True)
         # 大模型决策助手（未配置 key 时相关调用会安全降级为 None/异常）
         self.advisor = Advisor(cfg)
         # 人工接管保护：鼠标被人移动/点击即暂停全部输入（start 幂等，无权限时自动降级）
@@ -90,25 +89,21 @@ class BotContext:
         return img, self.ocr(img)
 
     def analyze(self, img: Optional[np.ndarray] = None,
-                results: Optional[List[OcrResult]] = None) -> List[Region]:
-        """三层视觉融合（模板 → YOLO → OCR），返回排好序的 Region 列表。
+                results: Optional[List[OcrResult]] = None,
+                layers: Optional[tuple] = None) -> List[Region]:
+        """多层视觉融合（模板 → UITag → 通用 → OCR），返回排好序的 Region 列表。
 
         复用传入的截图与全图 OCR 结果，保证一帧只做一次全图识别；
         不传则自行补齐，调用方无需关心内部顺序。
+        layers 可只跑需要的层（如 `("template",)`）：只有模板坐标的需求不必付
+        YOLO/实体推理的代价，见 vision/screen.py 的「按需裁剪层」。
         """
-        return analyze_regions(self, img, results)
+        return analyze_regions(self, img, results, layers=layers)
 
     @staticmethod
     def find_in(results, keyword: str, exact: bool = False) -> Optional[OcrResult]:
         """在 snapshot 的 results 里匹配关键字（不再 OCR）。"""
         return match_text(results, keyword, exact=exact)
-
-    def find_template(self, name: str, img: Optional[np.ndarray] = None,
-                      region=None, threshold: Optional[float] = None,
-                      multi_scale: bool = False) -> Optional[TemplateMatch]:
-        return self.templates.find(img if img is not None else self.grab(), name,
-                                   threshold=threshold, region=region,
-                                   multi_scale=multi_scale)
 
     # ---------- 等待 ----------
     def wait_text(self, keyword: str, timeout: float = 15.0,
@@ -123,23 +118,6 @@ class BotContext:
                 return hit
             time.sleep(interval)
         return None
-
-    def wait_template(self, name: str, timeout: float = 15.0,
-                      interval: float = 0.8, **kw) -> Optional[TemplateMatch]:
-        return self.templates.wait_for(self.grab, name, timeout=timeout,
-                                       interval=interval, **kw)
-
-    def wait_gone(self, keyword: str, timeout: float = 20.0,
-                  interval: float = 1.0) -> bool:
-        """等待某文字从画面消失（如加载提示、进度文案）。"""
-        end = time.time() + timeout
-        while time.time() < end and not is_stopped():
-            if not self.guard():
-                return False
-            if self.find_text(keyword) is None:
-                return True
-            time.sleep(interval)
-        return False
 
     # ---------- 行动 ----------
     def click_point(self, px: float, py: float, **kw) -> None:
@@ -159,25 +137,3 @@ class BotContext:
         _log.info("点击文字 %r (%d,%d)", keyword, hit.cx, hit.cy)
         self.input.click(hit.cx, hit.cy)
         return True
-
-    def click_template(self, name: str, timeout: float = 10.0, **kw) -> bool:
-        m = (self.templates.wait_for(self.grab, name, timeout=timeout, **kw)
-             if timeout > 0 else self.find_template(name, **kw))
-        if m is None:
-            _log.debug("未找到模板 %r，放弃点击", name)
-            return False
-        _log.info("点击模板 %r (%d,%d)", name, m.cx, m.cy)
-        self.input.click(m.cx, m.cy)
-        return True
-
-    def snap(self, tag: str) -> Optional[str]:
-        """保存调试截图。"""
-        if not self.save_debug:
-            return None
-        try:
-            path = cap.debug_save(self.grab(), tag, self.debug_dir)
-            _log.info("保存调试截图 %s", path)
-            return path
-        except Exception as e:
-            _log.warning("保存调试截图失败 tag=%s: %s", tag, e)
-            return None

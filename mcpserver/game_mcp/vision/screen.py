@@ -13,7 +13,7 @@
  ├─ yolo 层   ：UITag 分类控件 button/task/info/dialog/icon → 逐框 OCR(region=box) → Region(source=yolo)
  ├─ general 层：通用模型找游戏实体（人物/NPC）→ Region(kind=entity, source=general)
  ├─ ocr 层    ：全图 OCR 中「未被任何区域覆盖」的文本 → Region(kind=label, source=ocr) 兜底
- └─ 融合去重（template > yolo > ocr）
+ └─ 融合去重（template > yolo > general > ocr）
 ```
 
 ## 融合顺序（无歧义版）
@@ -28,8 +28,14 @@
    **不认领框内文字**，所以血条旁的怪物名依旧会进 label 层。
 4. 全图 OCR 结果里，中心点落在任一已生成区域内的文本丢弃（已被认领）；
    剩下的按「同一行且水平相邻」聚合成 `kind=label` 区域。
-4. 排序：可点类（button > icon > task）排前，只读类（dialog > task > entity > info > label）排后，
+5. 排序：可点类（button > icon > task）排前，只读类（dialog > entity > info > label）排后，
    各自内部按 `(cy, cx)` 阅读序，总数截断 `max_n`。
+
+## 按需裁剪层
+
+`analyze_regions(..., layers=("template",))` 只跑模板层：`back_to_main` 要的只是关闭键
+模板坐标，没必要为此白跑两次模型推理（UITag + 通用）和每框一次区内 OCR。同理只要文字时
+直接 `ctx.ocr()` 即可，不必付融合层的代价。
 
 ## 降级
 
@@ -51,10 +57,16 @@ _log = get_logger("vision.screen")
 
 Box = Tuple[int, int, int, int]
 
-# 同一个 kind 集合内的排序优先级（越小越靠前）
+# 排序优先级（越小越靠前）。两张表的 kind 互不重叠：区域先按 _CLICKABLE_ORDER
+# 分成「可点 / 只读」两组，各自再按自己那张表排序。
+# 旧版只读表里也列了 icon/task/button，但分流之后它们不可能落在只读组，属于必须
+# 手工同步的冗余项（新增可点类型时容易漏改），已删除。
 _CLICKABLE_ORDER = {"button": 0, "icon": 1, "task": 2}
-_READONLY_ORDER = {"dialog": 0, "task": 1, "entity": 2, "info": 3, "icon": 4,
-                   "label": 5, "button": 6}
+_READONLY_ORDER = {"dialog": 0, "entity": 1, "info": 2, "label": 3}
+
+# analyze_regions 的三类来源（yolo 层内部再分 UITag / 通用两级）；
+# 传 layers 可只跑需要的那几类
+_ALL_LAYERS = ("template", "yolo", "ocr")
 
 _MIN_BOX_SIDE = 12          # 小于此边长的框不做区内 OCR
 _TEMPLATE_IOU_DROP = 0.5    # 与模板命中重叠到此程度的 YOLO 框丢弃
@@ -177,20 +189,24 @@ def _template_regions(ctx, img: np.ndarray,
     return regions
 
 
-def detect_layers(ctx, img: np.ndarray) -> List[Detection]:
+def detect_layers(ctx, img: np.ndarray, layers: Tuple[str, ...] = ("ui", "general"),
+                  classes: Optional[List[str]] = None) -> List[Detection]:
     """两级检测：先用 UITag 定控件，再用通用模型找游戏实体，合并后去重。
 
+    layers 决定跑哪几层（`ui` / `general`）：只跑 ui 或只跑 general 时原样返回该层结果、
+    不做跨层去重（调用方明确只要这一层）。classes 非空时同时作用于两层。
     去重规则（UI 优先）：与 UITag 框 IoU >= 0.5 的实体框丢弃；中心点落在可点 UI 区域
     （头像按钮之类）里的也丢弃；实体框之间按 IoU 0.7 去重。返回 UITag 结果在前。
     任一层不可用（权重缺失/未安装）只会少一半结果，不影响另一层。
     """
     ui_dets: List[Detection] = []
-    try:
-        ui_dets = ctx.yolo.detect_ui(img)
-    except Exception as e:  # noqa: BLE001
-        _log.warning("UITag 检测失败，跳过该层: %s", e)
+    if "ui" in layers:
+        try:
+            ui_dets = ctx.yolo.detect_ui(img, classes=classes)
+        except Exception as e:  # noqa: BLE001
+            _log.warning("UITag 检测失败，跳过该层: %s", e)
     general = getattr(ctx, "general", None)
-    if general is None:
+    if "general" not in layers or general is None:
         return ui_dets
     cfg = getattr(ctx, "cfg", {}) or {}
     gcfg = cfg.get("general", {}) or {}
@@ -198,7 +214,7 @@ def detect_layers(ctx, img: np.ndarray) -> List[Detection]:
     ui_boxes = [d.box for d in ui_dets]
     hot_boxes = [d.box for d in ui_dets if d.kind in clickable]
     try:
-        g_dets = general.detect(img, classes=list(gcfg.get("classes") or []) or None)
+        g_dets = general.detect(img, classes=list(classes or gcfg.get("classes") or []) or None)
     except Exception as e:  # noqa: BLE001
         _log.warning("通用检测失败，跳过该层: %s", e)
         return ui_dets
@@ -219,10 +235,11 @@ def detect_layers(ctx, img: np.ndarray) -> List[Detection]:
 
 
 def _yolo_regions(ctx, img: np.ndarray, ocr_min_conf: float,
-                  template_boxes: List[Box]) -> List[Region]:
+                  template_boxes: List[Box],
+                  layers: Tuple[str, ...] = ("ui", "general")) -> List[Region]:
     """YOLO 层：UITag 控片区 + 通用实体区（实体不读框内文字，留给 label 层）。"""
     img_area = max(1, img.shape[0] * img.shape[1])
-    dets = detect_layers(ctx, img)
+    dets = detect_layers(ctx, img, layers=layers)
     regions: List[Region] = []
     accepted: List[Box] = []
     for det in sorted(dets, key=lambda d: -d.confidence):
@@ -254,7 +271,11 @@ def _yolo_regions(ctx, img: np.ndarray, ocr_min_conf: float,
             source="general" if is_entity else "yolo",
             confidence=float(det.confidence),
             points=points,
-            meta={"general_label": det.label} if is_entity else {"yolo_label": det.label},
+            # container 标记供上层决定「要不要认领文字」，不用再算一次面积、也
+            # 不依赖「kind 被降级成 info」这个副作用
+            meta={"general_label": det.label} if is_entity
+            else {"yolo_label": det.label, "container": True} if is_container
+            else {"yolo_label": det.label},
         ))
     if regions:
         _log.debug("YOLO 层命中 %d 处: %s", len(regions),
@@ -303,31 +324,33 @@ def _label_regions(results: List[OcrResult], claimed: List[Box]) -> List[Region]
 # ---------- 对外入口 ----------
 def analyze_regions(ctx, img: Optional[np.ndarray] = None,
                     results: Optional[List[OcrResult]] = None,
-                    max_n: int = 50) -> List[Region]:
+                    max_n: int = 50,
+                    layers: Optional[Tuple[str, ...]] = None) -> List[Region]:
     """多层融合（模板 / UITag / 通用 / OCR），返回排好序的 Region 列表（可点类在前，只读类在后）。
 
     ctx 为 BotContext（需要 cfg / templates / yolo / general / ocr_min_conf）。
     results 传全图 OCR 结果可避免重复识别；为 None 时按需补一次。
+    layers 只影响「跑哪几层」（template / yolo / ocr），省略即全跑：只关心模板坐标时
+    传 `("template",)` 可以省掉两次模型推理；只关心文字时直接用 `ctx.ocr()` 更便宜。
     """
+    wanted = tuple(layers or _ALL_LAYERS)
     if img is None:
         img = ctx.grab()
     if results is None:
         results = ctx.ocr(img)
     ocr_min_conf = getattr(ctx, "ocr_min_conf", 0.5)
 
-    template_regions = _template_regions(ctx, img, results)
-    yolo_regions = _yolo_regions(ctx, img, ocr_min_conf,
-                                [r.box for r in template_regions])
+    template_regions = _template_regions(ctx, img, results) if "template" in wanted else []
+    yolo_regions = (_yolo_regions(ctx, img, ocr_min_conf, [r.box for r in template_regions])
+                    if "yolo" in wanted else [])
     claimed = [r.box for r in template_regions]
-    # 大容器框不认领文字：否则一块「窗口/面板/工具栏」就把整屏 OCR 全吃进 info 区，
-    # label 层拿不到文字，empty_clickable_fallback 也就无从降级。
+    # 大容器框（和实体框）不认领文字：否则一块「窗口/面板/工具栏」就把整屏 OCR
+    # 全吃进 info 区，label 层拿不到文字，empty_clickable_fallback 也就无从降级。
     for r in yolo_regions:
-        if r.kind == "entity":
-            continue                      # 实体框不认领文字：血条旁的怪物名还要进 label 层
-        if r.kind == "info" and _area(r.box) > img.shape[0] * img.shape[1] * _CONTAINER_AREA_RATIO:
+        if r.kind == "entity" or (r.meta or {}).get("container"):
             continue
         claimed.append(r.box)
-    label_regions = _label_regions(results, claimed)
+    label_regions = _label_regions(results, claimed) if "ocr" in wanted else []
 
     regions = template_regions + yolo_regions + label_regions
     clickable = sorted(

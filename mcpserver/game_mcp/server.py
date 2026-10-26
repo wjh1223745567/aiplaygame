@@ -19,7 +19,6 @@ import os
 import platform
 import signal
 import time
-import types
 from typing import List, Optional
 
 from mcp.server.mcpserver import MCPServer
@@ -31,7 +30,6 @@ from .core import input as user_input
 from .core.engine import BotContext
 from .core.human_guard import get_guard
 from .core.window import find_game_window, list_windows as _list_windows
-from .vision.yolo import YoloDetector
 from .vision.screen import detect_layers
 from .tools import game as game_tools
 from .tools import daily as daily_tools
@@ -39,6 +37,14 @@ from .tools import daily as daily_tools
 app = MCPServer("wendao-game", version="0.1.0")
 
 log = runlog.get_logger("server")
+
+
+class WindowNotFound(RuntimeError):
+    """当前没有可用的游戏窗口（未启动 / 最小化 / 在其他桌面）。
+
+    属于预期状态而非程序缺陷：`_traced` 统一把它转成 `ok=false`，
+    省掉每个工具各写一遍 `try/except RuntimeError` 的样板。
+    """
 
 
 def _ms(started: float) -> int:
@@ -73,12 +79,15 @@ def tool(fn):
     做法：先照原函数原样注册（schema 完全由原签名与原返回注解推导，不受影响），
     再把 Tool 的执行入口 `fn` 换成带日志的包装——这样既能统一埋点，
     也不会因为包装函数改变 structured output 的推导结果。
+    返回值也用包装函数：直接调模块函数（调试/单测）与 MCP 调用走同一条路径，
+    否则 `WindowNotFound` 这类统一处理只在 MCP 入口生效。
     """
     app.tool()(fn)
+    wrapped = _traced(fn)
     registered = app._tool_manager.get_tool(fn.__name__)
     if registered is not None:
-        registered.fn = _traced(fn)
-    return fn
+        registered.fn = wrapped
+    return wrapped
 
 
 def _traced(fn):
@@ -104,6 +113,11 @@ def _traced(fn):
             return blocked
         try:
             result = fn(*args, **kwargs)
+        except WindowNotFound as e:
+            # 没有可用窗口是可预期状态：统一转 ok=false，工具自己不必再拦一遍
+            log.warning("工具 %s 无可用窗口 %dms 参数=%s: %s",
+                        name, _ms(started), shown, e)
+            return _err(str(e))
         except Exception as e:  # noqa: BLE001 照旧抛给 MCP，但先留痕
             log.error("工具 %s 异常 %dms 参数=%s: %s",
                       name, _ms(started), shown, e, exc_info=True)
@@ -126,14 +140,14 @@ def _find_win(cfg: dict):
 
 
 def _make_ctx(dry_run: bool = False) -> BotContext:
-    """按当前配置与前台游戏窗口构造 BotContext；无窗口时抛错由工具捕获。"""
+    """按当前配置与前台游戏窗口构造 BotContext；无窗口时抛 WindowNotFound。"""
     cfg = cfgmod.load_config()
     user_input.set_dry_run(dry_run)
     win = _find_win(cfg)
     if win is None:
         log.warning("未找到游戏窗口（关键词=%s），请先 open_game 或手动打开",
                     cfg.get("window", {}).get("title_keywords"))
-        raise RuntimeError("未找到游戏窗口（请先 open_game 或手动打开游戏）")
+        raise WindowNotFound("未找到游戏窗口（请先 open_game 或手动打开游戏）")
     log.debug("命中游戏窗口 %s dry_run=%s", win, dry_run)
     return BotContext(cfg, win)
 
@@ -173,10 +187,7 @@ def capture(tag: str = "capture") -> dict:
 
     只读无副作用；窗口没打开时返回 ok=false。只想知道画面里有哪些文字用 ocr 更快。
     """
-    try:
-        ctx = _make_ctx()
-    except RuntimeError as e:
-        return _err(str(e))
+    ctx = _make_ctx()
     img = ctx.grab()
     path = cap.debug_save(img, tag, ctx.debug_dir)
     return _ok(path=path, width=img.shape[1], height=img.shape[0], scale=ctx.win.scale)
@@ -190,10 +201,7 @@ def ocr(keyword: Optional[str] = None, region: Optional[List[int]] = None) -> di
     region 传 [x1,y1,x2,y2] 时只识别该区域（弹窗/面板内部），坐标仍回换算到整图。
     只读无副作用；cx/cy 可直接喂给 click_point，点击前不确定目标在哪就先 ocr。
     """
-    try:
-        ctx = _make_ctx()
-    except RuntimeError as e:
-        return _err(str(e))
+    ctx = _make_ctx()
     img = ctx.grab()
     results = ctx.ocr(img, region=region)
     if keyword:
@@ -215,10 +223,7 @@ def layout() -> dict:
     其余（含 entity 游戏实体）只是供判断的只读信息。
     只读无副作用；模板与 YOLO 都未就绪时等价于 OCR 按行聚合的文本（source=ocr）。
     """
-    try:
-        ctx = _make_ctx()
-    except RuntimeError as e:
-        return _err(str(e))
+    ctx = _make_ctx()
     regions = ctx.analyze()
     return _ok(count=len(regions), regions=[
         {**r.to_dict(), "confidence": round(r.confidence, 3)} for r in regions
@@ -235,42 +240,31 @@ def detect(classes: Optional[List[str]] = None, layer: str = "all") -> dict:
     classes 非空时只保留匹配的检测：可写模型类别名（Button / person）也可写内部 kind
     （button / icon / entity…），不区分大小写；为空时 ui 层用 ui_classes、general 层用
     general.classes。kind 决定该区域是否可点（见 vision.clickable_kinds，现阶段仅 button），
-    layer=general 的结果一律是只读锚点。权重缺失时返回 ok=false。只读无副作用。
+    layer=general 的结果一律是只读锚点。本层只做区域分类，不区分按钮语义（保存还是取消
+    由区内 OCR 文字给出），也不输出坐标给模型选；复用会话上已建好的两个检测器（权重懒加载
+    且实例级缓存），不会每次调用都重新读盘。权重缺失时返回 ok=false。只读无副作用。
     """
-    try:
-        cfg = cfgmod.load_config()
-        win = _find_win(cfg)
-        if win is None:
-            return _err("未找到游戏窗口")
-        img = cap.capture_window(win)
-        layer = (layer or "all").strip().lower()
-        if layer not in ("all", "ui", "general"):
-            return _err("layer 只能是 all / ui / general")
-        ui = YoloDetector({**dict(cfg.get("yolo", {})), "enabled": layer != "general"})
-        gen = YoloDetector({**dict(cfg.get("general", {})), "layer": "general",
-                            "enabled": layer != "ui"})
-        if layer == "all":
-            dets = detect_layers(types.SimpleNamespace(cfg=cfg, yolo=ui, general=gen), img)
-        elif layer == "ui":
-            dets = ui.detect_ui(img, classes=classes)
-        else:
-            g_classes = classes or list((cfg.get("general", {}) or {}).get("classes") or [])
-            dets = gen.detect(img, classes=g_classes or None)
-        errs = [f"{name}: {d._load_error}" for name, d in (("ui", ui), ("general", gen))
-                if d._load_error]
-        if not dets and errs:
-            return _err("YOLO 加载失败 " + "；".join(errs))
-        return _ok(count=len(dets),
-                   model_classes={"ui": ui.class_names, "general": gen.class_names},
-                   detections=[
-                       {"label": d.label, "kind": d.kind, "layer": d.layer,
-                        "confidence": round(d.confidence, 3),
-                        "box": list(d.box), "cx": round(d.cx), "cy": round(d.cy)}
-                       for d in dets
-                   ],
-                   **({"warnings": errs} if errs else {}))
-    except Exception as e:  # noqa: BLE001
-        return _err(f"检测异常: {e}")
+    layer = (layer or "all").strip().lower()
+    if layer not in ("all", "ui", "general"):
+        return _err("layer 只能是 all / ui / general")
+    ctx = _make_ctx()
+    layers = ("ui", "general") if layer == "all" else (layer,)
+    dets = detect_layers(ctx, ctx.grab(), layers=layers, classes=classes)
+    errs = [f"{name}: {d._load_error}"
+            for name, d in (("ui", ctx.yolo), ("general", ctx.general))
+            if name in layers and d._load_error]
+    if not dets and errs:
+        return _err("YOLO 加载失败 " + "；".join(errs))
+    return _ok(count=len(dets),
+               model_classes={"ui": ctx.yolo.class_names,
+                              "general": ctx.general.class_names},
+               detections=[
+                   {"label": d.label, "kind": d.kind, "layer": d.layer,
+                    "confidence": round(d.confidence, 3),
+                    "box": list(d.box), "cx": round(d.cx), "cy": round(d.cy)}
+                   for d in dets
+               ],
+               **({"warnings": errs} if errs else {}))
 
 
 @tool
@@ -279,10 +273,7 @@ def click_point(x: float, y: float, dry_run: bool = False) -> dict:
 
     dry_run=True 只打印不点击。真实操作：只在用户明确要求，或看屏确认位置后使用。
     """
-    try:
-        ctx = _make_ctx(dry_run=dry_run)
-    except RuntimeError as e:
-        return _err(str(e))
+    ctx = _make_ctx(dry_run=dry_run)
     ctx.click_point(x, y)
     return _ok(clicked=[x, y], dry_run=dry_run)
 
@@ -294,10 +285,7 @@ def click_text(text: str, dry_run: bool = False) -> dict:
     默认最多等 10 秒，找不到返回 ok=false 且不点击；有多个同名文本时改用 ocr 拿 cx/cy 再 click_point。
     dry_run=True 只打印不点击。真实操作：只点用户明确指定的目标。
     """
-    try:
-        ctx = _make_ctx(dry_run=dry_run)
-    except RuntimeError as e:
-        return _err(str(e))
+    ctx = _make_ctx(dry_run=dry_run)
     hit = ctx.click_text(text)
     if not hit:
         return _err(f"未找到文本: {text}")
@@ -312,10 +300,7 @@ def press_key(key: str, dry_run: bool = False) -> dict:
     dry_run=True 只打印不按键。窗口不在前台时不发送并返回 ok=false（避免按键落到别的应用上）。
     真实操作：用户明确要求按键时才按。
     """
-    try:
-        ctx = _make_ctx(dry_run=dry_run)
-    except RuntimeError as e:
-        return _err(str(e))
+    ctx = _make_ctx(dry_run=dry_run)
     if not ctx.input.press_key(key):
         return _err(f"按键 {key} 未发送：游戏窗口不在前台，避免落到其他应用")
     return _ok(key=key, dry_run=dry_run)
@@ -329,10 +314,7 @@ def advise(goal: str = "", dry_run: bool = True) -> dict:
     clickable 是带 id 的可点项（现阶段只有按钮类区域），context 是只读画面信息，模型只能从 clickable 选 id。
     dry_run 对 advise 无实际影响（它从不点击）。
     """
-    try:
-        ctx = _make_ctx(dry_run=dry_run)
-    except RuntimeError as e:
-        return _err(str(e))
+    ctx = _make_ctx(dry_run=dry_run)
     if not ctx.advisor.api_key:
         return _err("未配置 llm.api_key")
     from .vision.llm import LlmError
@@ -434,10 +416,7 @@ def daily_task(goal: str = "", max_steps: int = 120, dry_run: bool = False) -> d
     goal 为空用内置目标；max_steps 是循环上限（默认 120 步，每步调一次视觉模型，整体可能几分钟）；
     dry_run=True 只看不动。属长耗时操作，调用前先确认游戏已登录进主界面。
     """
-    try:
-        ctx = _make_ctx(dry_run=dry_run)
-    except RuntimeError as e:
-        return _err(str(e))
+    ctx = _make_ctx(dry_run=dry_run)
     return daily_tools.daily_task(ctx, goal=goal, max_steps=max_steps)
 
 
@@ -448,10 +427,7 @@ def market_scan(goal: str = "", max_steps: int = 120, dry_run: bool = False) -> 
     goal 可传筛选条件（如“只买低于 1 万的宝石”）；max_steps 是循环上限（默认 120 步）；
     dry_run=True 只看不动。需要游戏已停在集市/商铺界面，否则大概率空转。
     """
-    try:
-        ctx = _make_ctx(dry_run=dry_run)
-    except RuntimeError as e:
-        return _err(str(e))
+    ctx = _make_ctx(dry_run=dry_run)
     return daily_tools.market_scan(ctx, goal=goal, max_steps=max_steps)
 
 

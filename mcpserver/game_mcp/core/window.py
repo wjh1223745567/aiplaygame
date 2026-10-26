@@ -4,7 +4,8 @@ from __future__ import annotations
 import os
 import re
 import signal
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass
 from typing import List, Optional
 
 import Quartz
@@ -240,7 +241,6 @@ def ensure_front(win: WindowInfo, timeout: float = 1.2, poll: float = 0.05) -> b
     已在顶层时仅一次轻量查询即返回（热路径开销可忽略）；需切换时
     采用“发起激活 + 短轮询 + 重试”，避免系统切换延迟导致的单次回读误判。
     """
-    import time
     if is_game_frontmost(win):
         return True
     _log.debug("窗口不在前台，尝试激活 %s", win.owner)

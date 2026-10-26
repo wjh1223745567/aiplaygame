@@ -1,13 +1,18 @@
 """YOLO 目标检测（可选模块，只做 UI 区域分类）。
 
-推荐权重 `uitag-yolo11s-ui-detect-v1`（YOLO11s 微调，桌面软件截图 9 类，含 Button）：
+推荐权重 `yolo-ui.pt`（YOLO11s 在 GroundCUA 上微调，桌面截图 9 类，含 Button），
+本地放 `assets/models/yolo-ui.pt`。它随 `uitag` PyPI 包一起分发（包内 `uitag/models/yolo-ui.pt`），
+不必走 gated 的 HF 仓库、也不用装该包那一堆 mlx-vlm / transformers 依赖。
+模型在 640x640 tile 上训练，`imgsz` 留 640；仓库名带版本号但产物名不带，别按仓库名重命名。
 它给出的是「这块是按钮/图标/文本…」，具体语义（保存还是取消）仍由区域内 OCR 文字给出，
 所以本层不需要认识按钮含义——模型类别只需要能归到内部 kind：
 button / icon / task / info / dialog / label。
 
-模型的类别名（`Button` / `Icon` / `Text` …）与内部 kind 不是一回事，检测后用 `CLASS_MAP`
-归一化；未收录的类别按 `info`（只读锚点，不会被点）处理并只 warning 一次，
-方便在 `yolo.class_map` 里补映射，换模型不用改代码。
+模型实际输出 9 类（GroundCUA 微调）：Button / Menu / Input_Elements / Navigation /
+Information_Display / Sidebar / Visual_Elements / Others / Unknown。类别名与内部 kind
+不是一回事，检测后用 `CLASS_MAP` 归一化：Button、Input_Elements 归一成 button（可点），
+其余归 info / icon 只读锚点；未收录的类别同样按 info 处理并只 warning 一次，
+在 `yolo.class_map` 里补一行即可覆盖（换模型不用改代码）。
 
 权重缺失时**不回退到 COCO 预训练模型**：COCO 的 person/car 当 UI 元素用只会坑死下游。
 只有显式配置 allow_pretrained_fallback=true 时才保留该回退（调试用）。
@@ -127,6 +132,15 @@ class Detection:
         return (self.box[1] + self.box[3]) / 2
 
 
+# 权重缓存（模块级）：ultralytics 加载 .pt 要读几十 MB 并建计算图，耗秒级。
+# 而每个工具调用都会新建 BotContext（→ 新 YoloDetector），若把模型存在实例上，
+# 就等于「每调一次工具重载一次权重」。实例只持有缓存里的同一个 model 对象。
+_MODEL_CACHE: dict = {}      # 路径 -> YOLO 模型
+_MODEL_ERRORS: dict = {}     # 路径 -> 加载失败原因（失败不重试，避免每次调用都卡住）
+_WARNED_PATHS: set = set()   # 已提示过的权重路径（缺失/加载失败），进程内只提示一次
+_WARNED_LABELS: set = set()  # 已提示过的未收录类别名，避免逐帧刷屏
+
+
 class YoloDetector:
     """ultralytics YOLO 的薄封装；模型未配置时全部接口安全降级为空结果。"""
 
@@ -134,12 +148,13 @@ class YoloDetector:
         cfg = cfg or {}
         self.enabled = bool(cfg.get("enabled", False))
         self.model_path = cfg.get("model_path") \
-            or "assets/models/uitag-yolo11s-ui-detect-v1.pt"
-        self.conf = float(cfg.get("conf_threshold", 0.4))
+            or "assets/models/yolo-ui.pt"
+        self.conf = float(cfg.get("conf_threshold", 0.25))
         self.device = cfg.get("device", "cpu")
-        # UI 元素都很小：imgsz 太小（640）时按钮缩成几个像素，召回会明显掉。
-        # imgsz 兼容旧的 max_side 键名，避免老配置需要改。
-        self.imgsz = int(cfg.get("imgsz") or cfg.get("max_side") or 1280)
+        # UI 层权重是在 640x640 tile 上训练的（GroundCUA），推理也用 640 才匹配训练分布：
+        # 实测同一张游戏截图，640 的最高 conf 0.71、1280 只有 0.31，且 640 快一倍多。
+        # 通用层（COCO 整图）不受此限，它自己在 general.imgsz 里配。
+        self.imgsz = int(cfg.get("imgsz") or cfg.get("max_side") or 640)
         self.ui_classes = list(cfg.get("ui_classes") or UI_CLASSES)
         # 模型类别名 -> 内部 kind 的补充映射（覆盖 CLASS_MAP），换模型时只改配置
         self.class_map = dict(cfg.get("class_map") or {})
@@ -154,7 +169,6 @@ class YoloDetector:
         self.allow_pretrained_fallback = bool(cfg.get("allow_pretrained_fallback", False))
         self._model = None
         self._load_error: Optional[str] = None
-        self._unknown: set = set()
 
     def _ensure_model(self):
         if self._model is not None or not self.enabled:
@@ -166,30 +180,51 @@ class YoloDetector:
                     # UI 模式下权重缺失就禁用该层，交给 template/OCR 兜底
                     self.enabled = False
                     self._load_error = f"UI 权重不存在: {path}"
-                    _log.warning("YOLO 权重 %s 不存在，UI 区域分类已禁用（不回退 COCO）", path)
+                    if path not in _WARNED_PATHS:
+                        _WARNED_PATHS.add(path)
+                        _log.warning("YOLO 权重 %s 不存在，UI 区域分类已禁用（不回退 COCO）",
+                                     path)
                     return None
-                _log.warning("权重 %s 不存在，按配置回退到 yolo11s.pt 预训练模型", path)
+                if path not in _WARNED_PATHS:
+                    _WARNED_PATHS.add(path)
+                    _log.warning("权重 %s 不存在，按配置回退到 yolo11s.pt 预训练模型", path)
                 path = "yolo11s.pt"
-            from ultralytics import YOLO
-            self._model = YOLO(path)
-            names = [str(v) for v in (getattr(self._model, "names", {}) or {}).values()]
-            _log.info("YOLO 模型已加载 %s（%d 类: %s）", path, len(names), names)
-            unmapped = [n for n in names if _lookup(n, self.class_map) is None]
-            if unmapped and not self._quiet_unknown:
-                _log.warning("YOLO 有 %d 个类别名未收录映射 %s，将按 %s 处理；"
-                             "需要改判定就在 class_map 里指定（如 {\"Checkbox\": \"button\"}）",
-                             len(unmapped), unmapped, self.default_kind)
+            key = os.path.abspath(path)
+            model = _MODEL_CACHE.get(key)
+            if model is None:
+                if key in _MODEL_ERRORS:
+                    raise RuntimeError(_MODEL_ERRORS[key])
+                from ultralytics import YOLO
+                try:
+                    model = YOLO(path)
+                except Exception as e:
+                    _MODEL_ERRORS[key] = str(e)   # 依赖未装/权重损坏：不每帧重试
+                    raise
+                _MODEL_CACHE[key] = model
+                names = [str(v) for v in (getattr(model, "names", {}) or {}).values()]
+                _log.info("YOLO 模型已加载 %s（%d 类: %s）", path, len(names), names)
+                unmapped = [n for n in names if _lookup(n, self.class_map) is None]
+                if unmapped and not self._quiet_unknown:
+                    _log.warning("YOLO 有 %d 个类别名未收录映射 %s，将按 %s 处理；"
+                                 "需要改判定就在 class_map 里指定（如 {\"Checkbox\": \"button\"}）",
+                                 len(unmapped), unmapped, self.default_kind)
+            self._model = model
         except Exception as e:  # 依赖未装或权重损坏
             self.enabled = False
             self._load_error = str(e)
-            _log.warning("YOLO 未启用（%s），跳过 UI 区域分类", e)
+            if self.model_path not in _WARNED_PATHS:
+                _WARNED_PATHS.add(self.model_path)
+                _log.warning("YOLO 未启用（%s），跳过 UI 区域分类", e)
         return self._model
 
     @property
     def class_names(self) -> List[str]:
-        """模型支持的全部类别名（未加载/加载失败时为空列表，用于核对映射）。"""
-        model = self._ensure_model()
-        return [str(v) for v in (getattr(model, "names", {}) or {}).values()]
+        """已加载模型支持的全部类别名（未加载/加载失败时为空列表，用于核对映射）。
+
+        刻意不主动触发加载：`detect` 工具只跑其中一层时，另一层不该为此白读一次权重。
+        """
+        names = getattr(self._model, "names", None) or {}
+        return [str(v) for v in names.values()]
 
     def detect_ui(self, img: np.ndarray, classes: Optional[List[str]] = None
                   ) -> List["Detection"]:
@@ -213,8 +248,8 @@ class YoloDetector:
                 kind = _lookup(label, self.class_map)
                 if kind is None:
                     kind = self.default_kind           # 未知类别只当锚点，绝不假设可点
-                    if not self._quiet_unknown and label not in self._unknown:
-                        self._unknown.add(label)        # 只提示一次，避免逐帧刷屏
+                    if not self._quiet_unknown and label not in _WARNED_LABELS:
+                        _WARNED_LABELS.add(label)       # 只提示一次（模块级），避免逐帧刷屏
                         _log.warning("YOLO 类别 %r 未收录映射，按 %s 处理；"
                                      "可在 class_map 里指定它的 kind", label, kind)
                 # classes 同时匹配模型类别名与内部 kind，两种写法都能筛

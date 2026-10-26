@@ -2,7 +2,7 @@
 
 ## 为什么需要「程序动作计数」
 
-本模块监听的是**全局**鼠标事件，而程序自己 `InputController.move_to()` 也是
+本模块监听的是**全局**鼠标事件，而程序自己 `InputController.click()` 也是
 一步一步写 `MouseController.position`（12 步插值），会被监听器当成「人在动鼠标」。
 若只按「有没有鼠标事件」判断，程序一移动鼠标就会把自己暂停死，而且永远恢复不了。
 
@@ -90,7 +90,7 @@ class HumanGuard:
             _log.warning(
                 "无 macOS「辅助功能/输入监控」权限：人工接管保护不生效"
                 "（同时鼠标键盘也无法被程序驱动）；"
-                "请在 系统设置 → 隐私与安全性 中勾选运行本进程的 App 后重启")
+                "请在系统设置 → 隐私与安全性中勾选运行本进程的 App 后重启")
             return False
         with self._lock:
             if self._started:

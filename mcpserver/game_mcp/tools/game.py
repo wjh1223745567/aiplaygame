@@ -110,7 +110,7 @@ def _ocr(cfg: dict, img):
     return ocr_image(img, min_confidence=cfg.get("ocr", {}).get("min_confidence", 0.5))
 
 
-# ---------- 区域辅助（三层融合输出 Region 列表，见 vision/screen.py） ----------
+# ---------- 区域辅助（多层视觉融合输出 Region 列表，见 vision/screen.py） ----------
 def _region_texts(regions) -> list[str]:
     """全部区域文字：既是画面指纹也是既有文案判定的输入。"""
     return [r.text for r in regions if r.text]
@@ -127,6 +127,29 @@ def _template_point(regions, *names: str):
         for r in regions:
             if (r.meta or {}).get("template") == name:
                 return r.points[0] if r.points else r.center
+    return None
+
+
+def _hit(texts: list[str], hints) -> bool:
+    """这批 OCR 文本里是否含 hints 中任意一个关键字（子串匹配）。
+
+    同时取代了 8 处 `any(any(h in t for h in H) for t in texts)` 手写双层推导：
+    层序丢了容易写成“存在某行包含所有关键字”，集中在这里一处不会错。
+    """
+    return any(h in t for t in texts for h in hints)
+
+
+def _pick_button(buttons, texts: list[str], used_count, limit: int) -> str | None:
+    """按候选顺序挑第一个「画面上有、且还没点满 limit 次」的按钮文案。
+
+    used_count(button) 由调用方提供（list.count 或 dict.get），这样关闭键与进入键
+    能共用同一套选择逻辑（原来 _close_button / _enter_button 是逐行相同的两份拷贝）。
+    """
+    for button in buttons:
+        if used_count(button) >= limit:
+            continue
+        if _hit(texts, (button,)):
+            return button
     return None
 
 
@@ -339,10 +362,11 @@ def back_to_main(cfg: dict, max_steps: int = BACK_MAX_STEPS) -> dict:
                     "error": "等待人工操作结束时被中断，已停止返回主界面流程"}
         img = ctx.grab()
         results = _ocr(cfg, img)
-        # 模板层只用来给「关闭键」精确坐标，文字判定仍走 OCR 原文，避免改变既有行为
-        regions = ctx.analyze(img, results)
+        # 模板层只用来给「关闭键」精确坐标，文字判定仍走 OCR 原文，避免改变既有行为。
+        # 其余三层（UITag / 通用 / 实体 OCR）的结果在这一步用不上，不必付 8 步 × 2 次推理的代价
+        regions = ctx.analyze(img, results, layers=("template",))
         texts = [r.text for r in results]
-        button = _close_button(texts, closed)
+        button = _pick_button(CLOSE_BUTTONS, texts, closed.count, DIALOG_MAX_CLICKS)
         hit = BotContext.find_in(results, button) if button else None
         if hit is not None:
             _log.info("back_to_main: 关闭「%s」(%d,%d)（第 %d 步）", button, hit.cx, hit.cy, step)
@@ -365,11 +389,11 @@ def back_to_main(cfg: dict, max_steps: int = BACK_MAX_STEPS) -> dict:
                     "already_in_main": not closed and esc == 0,
                     "closed": closed, "esc_presses": esc, "steps": step,
                     "window": str(win)}
-        if any(any(h in t for h in BATTLE_HINTS) for t in texts):
+        if _hit(texts, BATTLE_HINTS):
             _log.warning("back_to_main: 当前在战斗界面，不按 ESC（避免逃跑），放弃")
             return {"ok": False, "stage": "battle", "closed": closed, "esc_presses": esc,
                     "error": "当前在战斗界面，未做任何操作；等战斗结束再调"}
-        if any(any(h in t for h in LOADING_HINTS) for t in texts):
+        if _hit(texts, LOADING_HINTS):
             time.sleep(BACK_STEP_WAIT)
             continue
         # 面板（背包/商城/角色）的关闭键是无文字图标：按截图比例点右上角
@@ -389,16 +413,6 @@ def back_to_main(cfg: dict, max_steps: int = BACK_MAX_STEPS) -> dict:
     _log.warning("back_to_main: %d 步内未回到主界面（关弹窗 %s、ESC %d 次）", max_steps, closed, esc)
     return {"ok": False, "stage": "max_steps", "closed": closed, "esc_presses": esc,
             "error": f"{max_steps} 步内未回到主界面，可能卡在面板或弹窗，需要人工处理"}
-
-
-def _close_button(texts: list[str], closed: list[str]) -> str | None:
-    """画面上可点的关闭类按钮；已点满次数的跳过。"""
-    for button in CLOSE_BUTTONS:
-        if closed.count(button) >= DIALOG_MAX_CLICKS:
-            continue
-        if any(button in t for t in texts):
-            return button
-    return None
 
 
 def _panel_close_point(width: int, height: int,
@@ -452,7 +466,7 @@ def _wait_ready(ctx: BotContext, cfg: dict, timeout: float,
             return None
         img = ctx.grab()
         results = _ocr(cfg, img)
-        # 一帧只做一次全图 OCR：三层融合复用同一份截图与识别结果
+        # 一帧只做一次全图 OCR：多层融合复用同一份截图与识别结果
         regions = ctx.analyze(img, results)
         texts = [r.text for r in results]
         if _has_dialog(texts, regions):
@@ -467,8 +481,8 @@ def _wait_ready(ctx: BotContext, cfg: dict, timeout: float,
             continue
         # 登录按钮优先取可点按钮类区域；模板/YOLO 未就绪时为空，回退到全部文字
         button_texts = _button_texts(regions) or texts
-        hits = [b for b in LOGIN_BUTTONS if any(b in t for t in button_texts)]
-        loading = any(any(h in t for h in LOADING_HINTS) for t in texts)
+        hits = [b for b in LOGIN_BUTTONS if _hit(button_texts, (b,))]
+        loading = _hit(texts, LOADING_HINTS)
         if hits and not loading:
             return hits[0]
         time.sleep(1.0)
@@ -478,14 +492,14 @@ def _wait_ready(ctx: BotContext, cfg: dict, timeout: float,
 def _has_dialog(texts: list[str], regions=None) -> bool:
     """画面里是否有挡路的提示弹窗：弹窗区域、确认按钮或已知正文任一命中。
 
-    regions 传三层融合结果时，kind=dialog 的区域（模板 dialog_bg / YOLO dialog）
+    regions 传多层融合结果时，kind=dialog 的区域（模板 dialog_bg / YOLO dialog）
     直接算命中；不传则退化为纯文字判定，与改造前一致。
     """
     if regions is not None and any(r.kind == "dialog" and r.text for r in regions):
         return True
-    if any(any(b in t for t in texts) for b in DIALOG_CONFIRM_BUTTONS):
+    if _hit(texts, DIALOG_CONFIRM_BUTTONS):
         return True
-    return any(any(h in t for t in texts) for h in DIALOG_HINTS)
+    return _hit(texts, DIALOG_HINTS)
 
 
 def _confirm_dialog(ctx: BotContext, regions, results, texts: list[str],
@@ -498,7 +512,7 @@ def _confirm_dialog(ctx: BotContext, regions, results, texts: list[str],
     某个按钮点到上限后换下一个候选（而不是整体放弃）；连按钮文案都认不出时，
     按正文位置向下偏移兜底点一次，应对 OCR 把「确认」识别成别的字。
     """
-    if any(any(h in t for h in MAIN_SCENE_HINTS) for t in texts):
+    if _hit(texts, MAIN_SCENE_HINTS):
         return False
 
     # 1) 模板命中：close_x / confirm 直接给出精确中心，比 OCR 文字框稳
@@ -518,7 +532,7 @@ def _confirm_dialog(ctx: BotContext, regions, results, texts: list[str],
 
     # 2) 文字匹配：确定 / 确认 / 我知道了
     for button in DIALOG_CONFIRM_BUTTONS:
-        if not any(button in t for t in texts):
+        if not _hit(texts, (button,)):
             continue
         if dialogs is not None and dialogs.count(button) >= DIALOG_MAX_CLICKS:
             continue
@@ -559,14 +573,18 @@ def _main_scene_hit(texts: list[str]) -> bool:
     所以要求命中背包栏/地图名这类强特征，或者三个以上弱特征同时出现
     （商城面板实测只命中「商城」「地图」两个）。
     """
-    strong = any(any(h in t for h in MAIN_SCENE_STRONG) for t in texts)
-    weak = sum(1 for h in MAIN_SCENE_HINTS if any(h in t for t in texts))
+    strong = _hit(texts, MAIN_SCENE_STRONG)
+    weak = sum(1 for h in MAIN_SCENE_HINTS if _hit(texts, (h,)))
     return strong or weak >= 3
 
 
 def _in_main_scene(ctx: BotContext, cfg: dict) -> bool:
-    """单次截图三层融合判断是否已在主场景（文字取全部区域）。"""
-    return _main_scene_hit(_region_texts(ctx.analyze()))
+    """单次截图判断是否已在主场景。
+
+    只需全图 OCR 原文（HUD 文字不会被遮挡），不必跑区域融合：旧实现走 ctx.analyze()
+    会额外触发两次模型推理 + 每框一次区内 OCR，结果却只用到了文字。
+    """
+    return _main_scene_hit([r.text for r in ctx.ocr()])
 
 
 def _advance_to_main_scene(ctx: BotContext, cfg: dict, timeout: float,
@@ -594,8 +612,10 @@ def _advance_to_main_scene(ctx: BotContext, cfg: dict, timeout: float,
             _confirm_dialog(ctx, regions, results, texts, dialogs)
             time.sleep(0.8)
             continue
-        loading = any(any(h in t for h in LOADING_HINTS) for t in texts)
-        button = None if loading else _enter_button(_button_texts(regions) or texts, clicks)
+        loading = _hit(texts, LOADING_HINTS)
+        button = (None if loading
+                  else _pick_button(ENTER_BUTTONS, _button_texts(regions) or texts,
+                                    lambda b: clicks.get(b, 0), ENTER_MAX_CLICKS))
         hit = BotContext.find_in(results, button) if button else None
         if hit is not None:
             _log.info("login: 点「%s」推进主场景 (%d,%d)（第 %d 次）",
@@ -606,13 +626,3 @@ def _advance_to_main_scene(ctx: BotContext, cfg: dict, timeout: float,
             continue
         time.sleep(1.2)
     return False
-
-
-def _enter_button(texts: list[str], clicks: dict[str, int]) -> str | None:
-    """画面上还能点的进入类按钮；已点满次数的不再返回。"""
-    for button in ENTER_BUTTONS:
-        if clicks.get(button, 0) >= ENTER_MAX_CLICKS:
-            continue
-        if any(button in t for t in texts):
-            return button
-    return None

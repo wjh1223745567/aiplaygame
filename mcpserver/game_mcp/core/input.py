@@ -34,30 +34,6 @@ def is_dry_run() -> bool:
     return _DRY_RUN["enabled"]
 
 
-def has_accessibility() -> bool:
-    """macOS 辅助功能（合成键鼠事件）权限是否已授予当前进程。
-
-    非 macOS 或导入失败时返回 True（不阻断）。
-    """
-    try:
-        from ApplicationServices import AXIsProcessTrusted
-        return bool(AXIsProcessTrusted())
-    except Exception:  # noqa: BLE001
-        return True
-
-
-def check_accessibility_or_warn() -> bool:
-    """真机执行前自检：无权限时打印醒目提示。返回是否已授权。"""
-    if is_dry_run() or has_accessibility():
-        return True
-    _log.warning(
-        "未获得 macOS「辅助功能」权限：鼠标/键盘操作会被系统静默丢弃"
-        "（点了没反应、快捷键无效、鼠标不动）\n"
-        "  解决：系统设置 → 隐私与安全性 → 辅助功能，勾选运行本脚本的 App"
-        "（IDE 集成终端里运行时通常需勾选该 IDE）\n"
-        "  授权后必须完全退出并重启该 App 才会生效")
-    return False
-
 _HOTKEYS = {
     "esc": kb.Key.esc, "escape": kb.Key.esc,
     "enter": kb.Key.enter, "return": kb.Key.enter,
@@ -110,12 +86,6 @@ class InputController:
     # 每个写操作的两步顺序不能换：先 wait_if_paused() 再 program_action()。
     # 若先进入 program_action()，暂停等待期间计数不为 0，监听器会把人工事件
     # 当程序动作丢掉，人工接管永远无法结束。
-    def move_to(self, px: float, py: float) -> None:
-        if not get_guard().wait_if_paused():
-            return
-        with get_guard().program_action():
-            self._move_to_raw(px, py)
-
     def _move_to_raw(self, px: float, py: float) -> None:
         """真正的插值移动；调用方必须已处于 program_action() 内。"""
         gx, gy = self.to_global(px, py)
@@ -196,18 +166,6 @@ class InputController:
         self._tap(k)
         _log.info("按键 %s", key)
         return True
-
-    def press_enter(self) -> None:
-        if get_guard().wait_if_paused():
-            self._tap(kb.Key.enter)
-
-    def press_esc(self) -> None:
-        if get_guard().wait_if_paused():
-            self._tap(kb.Key.esc)
-
-    def press_tab(self) -> None:
-        if get_guard().wait_if_paused():
-            self._tap(kb.Key.tab)
 
     def hotkey(self, *keys: str) -> None:
         """组合键，如 hotkey('cmd', 'v')。"""

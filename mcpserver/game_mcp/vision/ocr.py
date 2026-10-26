@@ -97,18 +97,6 @@ def match_text(results: List[OcrResult], keyword: str,
     return best
 
 
-def match_all_text(results: List[OcrResult], keyword: str) -> List[OcrResult]:
-    """在已识别结果列表中查找所有匹配 keyword 的文本块。"""
-    target = _normalize(keyword)
-    return [r for r in results if target in _normalize(r.text)]
-
-
-def find_all_text(img: np.ndarray, keyword: str, **kw) -> List[OcrResult]:
-    """查找所有匹配关键字的文本块。"""
-    target = _normalize(keyword)
-    return [r for r in ocr_image(img, **kw) if target in _normalize(r.text)]
-
-
 def _normalize(text: str) -> str:
     """去掉空白与常见全角/半角差异，便于稳定匹配。"""
     text = re.sub(r"\s+", "", text)

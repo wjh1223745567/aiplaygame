@@ -4,8 +4,7 @@
     "exclude_keywords": ["更新", "下载", "登录器", "launcher"]
   },
   "capture": {
-    "debug_dir": "debug",
-    "save_debug": true
+    "debug_dir": "debug"
   },
   "input": {
     "click_random_offset": 4,
@@ -51,12 +50,17 @@
   },
   "yolo": {
     "enabled": true,
-    "model_path": "assets/models/uitag-yolo11s-ui-detect-v1.pt",
-    "conf_threshold": 0.4,
+    "model_path": "assets/models/yolo-ui.pt",
+    "conf_threshold": 0.25,
     "device": "cpu",
-    "imgsz": 1280,
+    "imgsz": 640,
     "ui_classes": ["button", "task", "info", "dialog", "icon"],
-    "class_map": {}
+    "class_map": {
+      "Sidebar": "info",
+      "Visual_Elements": "icon",
+      "Others": "info",
+      "Unknown": "info"
+    }
   },
   "general": {
     "enabled": true,

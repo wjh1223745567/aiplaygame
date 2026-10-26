@@ -18,7 +18,6 @@ import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -43,10 +42,6 @@ public class AiChatService {
 
     private static final int MAX_TOOL_RESULT_CHARS = 1600;
     private static final int MAX_HISTORY_MESSAGES = 40;
-
-    /** 目标达成类工具：成功后目标已完成，再让模型复述只是多烧一轮 3~4s。 */
-    private static final Set<String> TERMINAL_TOOLS =
-            Set.of("close_game", "open_game", "login", "back_to_main");
 
     private static final String SYSTEM_PROMPT = """
             你是「问道」桌面自动化的对话调试助手，运行在 host 层，通过 MCP 客户端调用 mcpserver 的工具。
@@ -208,7 +203,7 @@ public class AiChatService {
                 output = Map.of("ok", false, "error", String.valueOf(e.getMessage()));
             }
             long ms = System.currentTimeMillis() - started;
-            String rendered = truncate(toJson(output), MAX_TOOL_RESULT_CHARS);
+            String rendered = LlmClient.truncate(toJson(output), MAX_TOOL_RESULT_CHARS);
             // 工具自己报 ok=false 也算失败（服务层只抛异常时才置 failed）
             boolean bad = failed || (output instanceof Map<?, ?> m && Boolean.FALSE.equals(m.get("ok")));
 
@@ -269,15 +264,14 @@ public class AiChatService {
      * 「登录后做师门任务」）不能提前收尾，否则后半句会被丢掉。
      */
     private static boolean terminalNow(String tool, String userText) {
-        if (!TERMINAL_TOOLS.contains(tool)) {
-            return false;
-        }
+        // 终止工具与「是否还有后续动作」的判定合在一处：以前另有一份 TERMINAL_TOOLS 集合
+        // 要跟着这个 switch 同步改，漏一处就会出现点完不收尾或提前收尾
         return switch (tool) {
             case "open_game" -> !containsAny(userText, "登录", "进入游戏", "师门", "任务", "日常", "扫货");
             case "login" -> !containsAny(userText, "师门", "任务", "日常", "扫货", "领取");
             case "back_to_main" -> !containsAny(userText, "师门", "任务", "日常", "扫货", "领取", "登录");
             case "close_game" -> !containsAny(userText, "登录", "打开", "启动");
-            default -> true;
+            default -> false;
         };
     }
 
@@ -506,10 +500,6 @@ public class AiChatService {
         }
     }
 
-    private static String truncate(String text, int max) {
-        return LlmClient.truncate(text, max);
-    }
-
     private static String normalizeSession(String sessionId) {
         return sessionId == null || sessionId.isBlank() ? "default" : sessionId.trim();
     }
@@ -617,9 +607,7 @@ public class AiChatService {
                         .append(record.get("tool_ok")).append('\n');
                 sb.append("       结果 ").append(oneLine(record.get("tool_result"))).append('\n');
             }
-            if (Boolean.TRUE.equals(record.get("refused"))) {
-                sb.append("  拦截 ").append(oneLine(record.get("note"))).append('\n');
-            } else if (record.containsKey("note")) {
+            if (record.containsKey("note")) {
                 sb.append("  备注 ").append(oneLine(record.get("note"))).append('\n');
             }
         }
