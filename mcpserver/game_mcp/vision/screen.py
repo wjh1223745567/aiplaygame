@@ -39,14 +39,16 @@
 
 ## 降级
 
-模板目录为空、YOLO 未训练、两者都不可用时，全部文字落到 `kind=label`，
-上层 `build_candidates` 走 `empty_clickable_fallback` 退回改动前的纯文本候选行为。
+模板目录为空、YOLO 未训练、两者都不可用时，全部文字落到 `kind=label`；
+上层 `build_candidates` 只把「检测层认出的 button / icon 类」当可点候选，这些文字只能进只读上下文。
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+import cv2
 import numpy as np
 
 from ..core.log import get_logger
@@ -108,6 +110,22 @@ class Region:
                 **({"meta": self.meta} if self.meta else {})}
 
 
+def screen_key(regions: List[Region]) -> frozenset:
+    """画面指纹：全部区域文本的集合（模板区域用模板名补位）。
+
+    识别画面不能只看按钮——按钮相同、聊天/任务追踪不同也是别的画面；
+    无文字的区域若来自模板，用 ``@模板名`` 补位，否则这层信息就丢了。
+    绕圈规避与失败案例去重共用此实现，避免两份实现漂移。
+    """
+    marks = set()
+    for r in regions:
+        if r.text:
+            marks.add(r.text)
+        elif (r.meta or {}).get("template"):
+            marks.add("@" + str(r.meta["template"]))
+    return frozenset(marks)
+
+
 # ---------- 几何辅助 ----------
 def _area(box: Box) -> int:
     return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
@@ -134,6 +152,74 @@ def _union(boxes: List[Box]) -> Box:
 
 def _overlaps_any(box: Box, boxes: List[Box], threshold: float) -> bool:
     return any(_iou(box, other) >= threshold for other in boxes)
+
+
+# ---------- 顶层图层（弹窗遮罩） ----------
+# 亮度网格：一格约 33px（788 宽），够把面板边缘定到像素级
+_TOP_GRID = (24, 18)
+_TOP_BIMODAL = 2.5     # p75 >= p50 × 此倍数 才算「暗背景 + 亮面板」两簇
+_TOP_ABS_BRIGHT = 120  # 亮簇的绝对下限：整屏都暗时不谈分层
+_TOP_MIN_RATIO = 0.08  # 亮格占屏下限（太碎的是高光补丁，不是面板）
+_TOP_MAX_RATIO = 0.80  # 上限：几乎全屏都亮说明没有遮罩
+_TOP_MIN_FILL = 0.60   # 亮区外接框内的填充度：面板是矩形
+_TOP_MARGIN = 24       # 外接框外扩：关闭键/按钮常压在面板边线上
+_TOP_THICK = 0.3       # 投影厚度下限：排掉「标题栏」这种横跨一条的窄亮带
+
+
+def _proj_runs(mask) -> List[Tuple[int, int]]:
+    """一维 bool -> 连续段（允许 1 格间隙，面板中间被分隔线断一下不算断开）。"""
+    idx = np.nonzero(mask)[0]
+    if not len(idx):
+        return []
+    out: List[Tuple[int, int]] = []
+    start = prev = idx[0]
+    for i in idx[1:]:
+        if i - prev > 2:
+            out.append((start, prev))
+            start = i
+        prev = i
+    out.append((start, prev))
+    return out
+
+
+def top_layer_box(img: np.ndarray) -> Optional[Box]:
+    """找顶层面板矩形：弹窗打开时，被压暗的背景之外那块明亮的矩形。
+
+    问道这类客户端弹对话框时会先盖一层半透黑遮罩再画面板，于是亮度直方图
+    分成两簇（实测弹窗帧 p50=26 / p75=193，主场景只有 48 / 75）：取两簇几何
+    中点当阈值，再按投影取连片矩形（投影能排掉窗口标题栏那种横贯一条的亮带）。
+
+    返回 None 表示本帧没有分层，不要做任何门控。
+    为什么要这个：遮罩下的元素根本点不动（点击被遮罩吃了），不能当可点候选——
+    实测对话框打开时模板仍以 0.99 的分数命中暗处的 战斗教学/好友/实时，模型对着
+    遮罩连点 77 步画面纹丝不动。
+    """
+    h, w = img.shape[:2]
+    # 最大通道而非灰度：白/黄/红字的面板都亮，灰度会把彩色面板误判成暗区
+    grid = cv2.resize(img, _TOP_GRID, interpolation=cv2.INTER_AREA).max(axis=2).astype(float)
+    p50, p75 = np.percentile(grid, [50, 75])
+    if p75 < _TOP_ABS_BRIGHT or p75 < p50 * _TOP_BIMODAL:
+        return None
+    bright = grid >= math.sqrt(p50 * p75)
+    if not _TOP_MIN_RATIO <= bright.mean() <= _TOP_MAX_RATIO:
+        return None
+    cols = bright.sum(axis=0) >= max(3, _TOP_THICK * bright.sum(axis=0).max())
+    if cols.sum() < 3:
+        return None
+    rows = bright[:, cols].sum(axis=1) >= max(3, _TOP_THICK * bright[:, cols].sum(axis=1).max())
+    cr = _proj_runs(cols)
+    rr = _proj_runs(rows)
+    if not cr or not rr:
+        return None
+    x1, x2 = max(cr, key=lambda a: a[1] - a[0])
+    y1, y2 = max(rr, key=lambda a: a[1] - a[0])
+    y2 += 1
+    x2 += 1
+    if bright[y1:y2, x1:x2].mean() < _TOP_MIN_FILL:
+        return None
+    sx, sy = w / _TOP_GRID[0], h / _TOP_GRID[1]
+    return (max(0, int(x1 * sx) - _TOP_MARGIN), max(0, int(y1 * sy) - _TOP_MARGIN),
+            min(w, int(x2 * sx) + _TOP_MARGIN), min(h, int(y2 * sy) + _TOP_MARGIN))
 
 
 def _texts_in(results: List[OcrResult]) -> Tuple[str, List[Tuple[int, int]]]:
@@ -210,9 +296,14 @@ def detect_layers(ctx, img: np.ndarray, layers: Tuple[str, ...] = ("ui", "genera
         return ui_dets
     cfg = getattr(ctx, "cfg", {}) or {}
     gcfg = cfg.get("general", {}) or {}
-    clickable = set((cfg.get("vision", {}) or {}).get("clickable_kinds") or ("button",))
+    clickable = set((cfg.get("vision", {}) or {}).get("clickable_kinds") or ("button", "icon"))
     ui_boxes = [d.box for d in ui_dets]
-    hot_boxes = [d.box for d in ui_dets if d.kind in clickable]
+    # 只有小控件级别的命中才参与实体去重：icon 类经常出半屏大的容器框（一整块
+    # Visual_Elements/icon 罩住整个对话框），拿它当热区会把面板里的 NPC 实体锚点
+    # 整块吃掉——这种大框在 _yolo_regions 里本来就被降级成 info，也不可能是可点项。
+    img_area = max(1, img.shape[0] * img.shape[1])
+    hot_boxes = [d.box for d in ui_dets
+                 if d.kind in clickable and _area(d.box) <= img_area * _CONTAINER_AREA_RATIO]
     try:
         g_dets = general.detect(img, classes=list(classes or gcfg.get("classes") or []) or None)
     except Exception as e:  # noqa: BLE001
@@ -283,6 +374,61 @@ def _yolo_regions(ctx, img: np.ndarray, ocr_min_conf: float,
     return regions
 
 
+# ---------- 面板内的可点选项（彩色文本行） ----------
+# 问道对话框的选项没有底框，靠字色区分：可点的画彩色、纯说明的画白色。
+# 实测同一帧字身像元的饱和占比：选项 0.58-0.64 / 正文 0.12-0.13 / NPC 名 0.22，
+# 差 4~5 倍——比形状、边缘、行高那些判据稳得多（行高根本分不开）。
+_OPTION_SAT = 0.45       # 饱和占比下限：过了就当「彩色可点行」
+_OPTION_BRIGHT = 120     # 算字身的亮度下限（低于它是面板底色，不参与统计）
+_OPTION_CHROMA = 40      # 单像元算「有颜色」的 max-min 通道差下限
+_OPTION_MIN_SIDE = 10    # 太短的行是角标/时间戳，不当选项
+
+
+def _glyph_sat(img: np.ndarray, box: Box) -> float:
+    """框内字身像元的饱和占比：亮像元里 max-min 通道差超阈值的比例。"""
+    crop = img[box[1]:box[3], box[0]:box[2], :3].astype(np.int16)
+    if crop.size == 0:
+        return 0.0
+    bright = crop.max(axis=2) >= _OPTION_BRIGHT
+    if not bright.any():
+        return 0.0
+    px = crop[bright]
+    return float(((px.max(axis=1) - px.min(axis=1)) > _OPTION_CHROMA).mean())
+
+
+def option_regions(img: np.ndarray, top_box: Box, results: List[OcrResult],
+                   claimed: List[Box]) -> List[Region]:
+    """顶层面板内的「彩色文本行」当可点选项（kind=button、source=option）。
+
+    只在 top_box 命中（画面真的分层了）时调用，所以聊天频道、任务追踪里那些
+    彩色字不会被误当选项——它们不在面板内。已被模板/检测层认领的行不进（否则
+    「离开」会同时出现一个 YOLO 按钮和一个 option 选项）。
+    为什么不靠 YOLO 认这些行：UITag 在整个对话区只给一个 Visual_Elements/icon 大框（占屏
+    36%，刚过容器阈值被降级成 info），选项本身根本没有可点信号。
+    """
+    out: List[Region] = []
+    for r in results:
+        text = (r.text or "").strip()
+        if len(text) < 2 or not _center_in(top_box, r.cx, r.cy):
+            continue
+        if r.box[3] - r.box[1] < _OPTION_MIN_SIDE:
+            continue
+        if any(_center_in(b, r.cx, r.cy) for b in claimed):
+            continue
+        sat = _glyph_sat(img, r.box)
+        if sat < _OPTION_SAT:
+            continue
+        out.append(Region(
+            kind="button", box=r.box, text=text, source="option",
+            confidence=r.confidence, points=[(int(r.cx), int(r.cy))],
+            meta={"sat": round(sat, 2)},
+        ))
+    if out:
+        _log.info("面板内彩色选项 %d 行: %s",
+                  len(out), [(o.text[:10], o.meta["sat"]) for o in out])
+    return out
+
+
 def _label_regions(results: List[OcrResult], claimed: List[Box]) -> List[Region]:
     """OCR 兜底层：未被任何区域认领的文字按「同行且水平相邻」聚合成 label。"""
     leftovers = [r for r in results
@@ -348,14 +494,22 @@ def analyze_regions(ctx, img: Optional[np.ndarray] = None,
                     if "yolo" in wanted else [])
     claimed = [r.box for r in template_regions]
     # 大容器框（和实体框）不认领文字：否则一块「窗口/面板/工具栏」就把整屏 OCR
-    # 全吃进 info 区，label 层拿不到文字，empty_clickable_fallback 也就无从降级。
+    # 全吃进 info 区，只读上下文里就再也看不到那些文字了。
     for r in yolo_regions:
         if r.kind == "entity" or (r.meta or {}).get("container"):
             continue
         claimed.append(r.box)
+    # 弹窗打开时，面板内的彩色文本行就是可点选项（见 option_regions）
+    option_layer: List[Region] = []
+    vision = (getattr(ctx, "cfg", {}) or {}).get("vision", {}) or {}
+    if "ocr" in wanted and vision.get("option_by_color", True):
+        top_box = top_layer_box(img)
+        if top_box:
+            option_layer = option_regions(img, top_box, results, claimed)
+            claimed += [r.box for r in option_layer]
     label_regions = _label_regions(results, claimed) if "ocr" in wanted else []
 
-    regions = template_regions + yolo_regions + label_regions
+    regions = template_regions + yolo_regions + option_layer + label_regions
     clickable = sorted(
         [r for r in regions if r.kind in _CLICKABLE_ORDER],
         key=lambda r: (_CLICKABLE_ORDER.get(r.kind, 9), round(r.cy), r.cx))
@@ -363,7 +517,7 @@ def analyze_regions(ctx, img: Optional[np.ndarray] = None,
         [r for r in regions if r.kind not in _CLICKABLE_ORDER],
         key=lambda r: (_READONLY_ORDER.get(r.kind, 9), round(r.cy), r.cx))
     merged = (clickable + readonly)[:max(1, int(max_n))]
-    _log.debug("区域融合：模板 %d / 检测 %d / 兜底 %d → 可点 %d + 只读 %d",
-               len(template_regions), len(yolo_regions), len(label_regions),
-               len(clickable), len(readonly))
+    _log.debug("区域融合：模板 %d / 检测 %d / 选项 %d / 兜底 %d → 可点 %d + 只读 %d",
+               len(template_regions), len(yolo_regions), len(option_layer),
+               len(label_regions), len(clickable), len(readonly))
     return merged

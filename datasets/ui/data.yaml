@@ -1,0 +1,6 @@
+# 按钮检测训练集（scripts/label_helper.py 生成）
+path: /Users/wujunhui/Desktop/work/autogame/datasets/ui
+train: images
+val: images
+nc: 1
+names: ['button']

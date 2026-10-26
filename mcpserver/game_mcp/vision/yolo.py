@@ -55,7 +55,7 @@ CLASS_MAP = {
     # 图标/图片 -> icon
     "icon": "icon", "logo": "icon", "image": "icon", "picture": "icon",
     "avatar": "icon", "thumbnail": "icon", "图标": "icon", "图片": "icon",
-    # 文字 -> label（进 OCR 兜底层，可被 empty_clickable_fallback 提升为可点）
+    # 文字 -> label（只进只读上下文：文本本身不能点，可点候选只收 button 类）
     "text": "label", "label": "label", "paragraph": "label", "title": "label",
     "textblock": "label", "caption": "label", "文字": "label", "文本": "label",
     # 弹窗 -> dialog（会被 game.py 的 _has_dialog 当成挡路弹窗）

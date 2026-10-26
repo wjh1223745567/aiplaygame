@@ -107,7 +107,9 @@ class TemplateMatcher:
 
         scales = [1.0]
         if multi_scale:
-            scales = [0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15]
+            # 1.0 必须排第一：命中一个尺度就 break，先试缩小版会让同尺寸的模板停在 0.85 上
+            # （分数掉到 0.89 且框比实际大 15%），而原尺度本来能到 1.00。
+            scales = [1.0, 1.05, 0.95, 1.1, 0.9, 1.15, 0.85]
 
         best: List[TemplateMatch] = []
         gray = cv2.cvtColor(search, cv2.COLOR_BGR2GRAY)

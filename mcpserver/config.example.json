@@ -36,17 +36,25 @@
     "default_threshold": 0.85,
     "multi_scale": true,
     "items": {
-      "close_x":   {"file": "close_x.png",   "kind": "button"},
-      "confirm":   {"file": "confirm.png",   "kind": "button"},
-      "cancel":    {"file": "cancel.png",    "kind": "button"},
-      "task_row":  {"file": "task_row.png",  "kind": "task"},
-      "dialog_bg": {"file": "dialog_bg.png", "kind": "dialog"},
-      "bag_icon":  {"file": "bag.png",       "kind": "icon"}
+      "btn_friend":          {"file": "btn_friend.png",          "kind": "button"},
+      "btn_bag":             {"file": "btn_bag.png",             "kind": "button"},
+      "btn_expand":          {"file": "btn_expand.png",          "kind": "button"},
+      "btn_realtime":        {"file": "btn_realtime.png",        "kind": "button"},
+      "btn_shop_item":       {"file": "btn_shop_item.png",       "kind": "button"},
+      "btn_shop_takeout":    {"file": "btn_shop_takeout.png",    "kind": "button"},
+      "btn_battle_tutorial": {"file": "btn_battle_tutorial.png", "kind": "button"},
+      "btn_party":           {"file": "btn_party.png",           "kind": "button"},
+      "btn_task_accept":     {"file": "btn_task_accept.png",     "kind": "button"},
+      "btn_shimen":          {"file": "btn_shimen.png",          "kind": "button"}
     }
   },
   "vision": {
-    "clickable_kinds": ["button"],
-    "empty_clickable_fallback": true
+    "clickable_kinds": ["button", "icon"],
+    "clickable_sources": ["template", "yolo", "option"],
+    "gate_by_top_layer": true,
+    "option_by_color": true,
+    "collect_failed_shots": true,
+    "max_failed_shots": 300
   },
   "yolo": {
     "enabled": true,

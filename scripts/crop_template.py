@@ -22,7 +22,7 @@
   "close_x": {"file": "close_x.png", "kind": "button"}
 
 kind 取 button / icon / task / dialog / info：
-  · button 现阶段是唯一「可点」类型（对应 vision.clickable_kinds）；
+  · button / icon 是「可点」类型（对应 vision.clickable_kinds），info/task/dialog 只作只读锚点；
   · dialog 只作区域锚点，用来限定 OCR 范围，不会被点。
 新增模板只需裁图 + 加一行配置，不用改代码。
 """

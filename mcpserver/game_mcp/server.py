@@ -219,7 +219,7 @@ def layout() -> dict:
     regions[{kind,source,text,box,cx,cy,confidence}]。
 
     kind 取 button/icon/task/dialog/entity/info/label，source 取 template/yolo/general/ocr；
-    只有 kind 在 vision.clickable_kinds（现为 button）里的区域会被当作可点击项，
+    只有 kind 在 vision.clickable_kinds（现为 button / icon）里的区域会被当作可点击项，
     其余（含 entity 游戏实体）只是供判断的只读信息。
     只读无副作用；模板与 YOLO 都未就绪时等价于 OCR 按行聚合的文本（source=ocr）。
     """
@@ -239,7 +239,7 @@ def detect(classes: Optional[List[str]] = None, layer: str = "all") -> dict:
     ui（仅 UITag）、general（仅通用模型）。
     classes 非空时只保留匹配的检测：可写模型类别名（Button / person）也可写内部 kind
     （button / icon / entity…），不区分大小写；为空时 ui 层用 ui_classes、general 层用
-    general.classes。kind 决定该区域是否可点（见 vision.clickable_kinds，现阶段仅 button），
+    general.classes。kind 决定该区域是否可点（见 vision.clickable_kinds，现为 button / icon），
     layer=general 的结果一律是只读锚点。本层只做区域分类，不区分按钮语义（保存还是取消
     由区内 OCR 文字给出），也不输出坐标给模型选；复用会话上已建好的两个检测器（权重懒加载
     且实例级缓存），不会每次调用都重新读盘。权重缺失时返回 ok=false。只读无副作用。
@@ -320,8 +320,10 @@ def advise(goal: str = "", dry_run: bool = True) -> dict:
     from .vision.llm import LlmError
     img = ctx.grab()
     results = ctx.ocr(img)
+    size = (img.shape[1], img.shape[0])
     try:
-        plan = ctx.advisor.advise(img, ctx.analyze(img, results), goal=goal or "推进当前任务")
+        plan = ctx.advisor.advise(ctx.analyze(img, results), goal or "推进当前任务",
+                                 size=size)
     except LlmError as e:
         return _err(f"大模型调用失败: {e}")
     return _ok(scene=plan.get("scene"), reason=plan.get("reason"),

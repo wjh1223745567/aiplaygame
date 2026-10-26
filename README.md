@@ -130,8 +130,8 @@ java -jar host/target/host.jar --action=chat --message="现在是什么界面" -
 ```
 
 相关配置在 `host/config.json` 的 `llm` 段：`chat_max_rounds`（单次对话最多几轮模型请求，默认
-6）、`chat_vision`（默认是否附图，默认 true）。对话均走 `/ai/chat`，工具清单由 MCP `listTools()`
-实时生成，Python 侧加工具后无需改 Java。
+6）、`chat_vision`（是否把截图附给模型，默认 false，见下节）。对话均走 `/ai/chat`，工具清单由 MCP
+`listTools()` 实时生成，Python 侧加工具后无需改 Java。
 
 ### 免费模型的限流与自动降级
 
@@ -149,12 +149,40 @@ java -jar host/target/host.jar --action=chat --message="现在是什么界面" -
   `LlmClient` 会先剥掉这层包装再交给上层解 JSON（普通模型的 ```json 代码块不受影响）。
 - 实测：主模型正常 1.6s；主模型 429 时降级成功，整轮 5.7s。
 
-两个候选都必须是视觉模型——纯文本模型收到 `image_url` 会返回 400，把降级链打断。host（Java）与
-mcpserver（Python）读的是同一份名单，两边都会降级；`ai-decisions.log` 里的 `model=` 记的是实际
-用上的那个，降级时一眼能看出来。
+两个候选**不一定要是视觉模型**：决策默认不发图（见下节），纯文本模型（如 `glm-4-flash`）也能用，
+更快也更少被限流。host（Java）与 mcpserver（Python）读的是同一份名单，两边都会降级；
+`ai-decisions.log` 里的 `model=` 记的是实际用上的那个，降级时一眼能看出来。
 
 Python 侧额外一条：推理模型未闭合的 `<think>` 直接当本轮失败（而不是从思考里抽花括号当决策），
 避免拿半截思考去点错按钮。
+
+### 决策只发识别结果，不发截图
+
+模型看到的不是截图，而是我方视觉流水线在**当前画面**上的识别结果——YOLO 区域分类 + OCR 四层融合
+去重后的区域清单，每条带类型、文字、方位（相对整窗的九宫格）与像素尺寸：
+
+```text
+画面 788x619（每条末尾的方位按九宫格：上中=顶部居中，右下=右下角）
+目标：推进当前任务
+
+可点击项（只能从这些里选 id，不要发明新文字）：
+[8] (按钮) 师门任务  @中右(655,208) 59x18
+[9] (按钮) 与文殊天尊对话  @中右(677,232) 105x23
+
+画面其他信息（只读，用于判断，不要选）：
+实体: person  @下中(318,502) 40x86
+信息: 15:45 云营洞 巡逻 刷道 9线  @上中(277,61) 536x71
+```
+
+- 好处：请求体从「十几万字符的 base64」降到「一千字的清单」，延迟更低、也更少触发限流；
+  纯文本模型也能用；模型不可能「看图猜一个我点不到的坐标」——它只选 id，坐标由我方按区域回填。
+- 代价：模型看不到画面，所以**方位和尺寸必须写全**，否则它分不清「顶部导航 / 中央弹窗 / 右下确认」，
+  也分不清同名的两行文字。没文字的区域也不是全丢：`弹窗 @右下` 这种本身就有信息量，保留；
+  空的 `信息` / `文本` 区域才是噪声。
+- `chat_vision` 默认 `false`（Java 与 Python 两侧都是）。临时想让模型直接看图：`/ai/chat` 带
+  `{"vision":true}`，或 CLI `--vision=true`，或 REPL `:vision on`；这时 `max_image_side` 才生效。
+- 不发图时，host 会在用户消息末尾加一句提示，让模型需要看画面时自己调 `layout` 工具（返回的正是
+  同一份区域清单）。
 
 安全约定：**默认只读**——host 按这句话里有没有操作类措辞（打开 / 登录 / 帮我 / 点击 / 扫货…）
 判定本轮是否只读；只读轮里模型一旦想调 `click_point` / `press_key` / `open_game` 等，会被
@@ -193,7 +221,37 @@ grep 'ok=false' ai-decisions.log  # 只看失败的工具调用
 - 日志是旁路观察：写失败只打 WARN，不影响对话与游戏操作；超过 5MB 轮转为 `ai-decisions.log.1`。
 - 日志已加入 `.gitignore`，换机器排查直接拷走即可。
 
-### 4.2 mcpserver 运行日志
+### 4.2 发送给模型的请求体（prompt 原文）
+
+判断跑偏时，第一手要看的是「到底发过去什么」。两侧都在发送前把请求体写进日志：
+
+| 侧 | 落点 | 时机 |
+|---|---|---|
+| host（`LlmClient`） | 容器日志 `docker logs autogame-host` | 每次 HTTP 请求前 |
+| mcpserver（`Advisor.choose`） | `mcpserver.log` | 每次决策前 |
+
+```text
+INFO  [vision.llm] 发送给模型（user 1167 字 / 候选 26 项 / 只读 2 项）:
+画面 788x619（每条末尾的方位按九宫格：上中=顶部居中，右下=右下角）
+目标：推进当前任务
+
+可点击项（只能从这些里选 id，不要发明新文字）：
+[8] (文本) 师门任务  @中右(655,208) 59x18
+...
+画面其他信息（只读，用于判断，不要选）：
+实体: person  @下中(318,502) 40x86
+```
+
+两条长度约束，否则日志会自己把磁盘吃满：
+
+- **截图只留占位**：`[截图已省略]`。开 `vision=true` 时一张图 base64 十几万字符，照打会一条日志上百 KB。
+- **system 只打首次**：host 的 system 含全部工具描述（几千字），一轮多步对话里会重复 6 遍；内容哈希
+  未变时只写 `--- system --- [同前一条，共 4523 字]`。mcpserver 的 `SYSTEM_PROMPT` 是固定模板，
+  进程内首次打印。
+
+再配上 `ai-decisions.log` 里的「原始」（模型返回原文），一次决策的输入与输出就都齐了。
+
+### 4.3 mcpserver 运行日志
 
 Python 侧的运行日志写在项目根的 **`mcpserver.log`**（与 `ai-decisions.log` 并列），
 由 `game_mcp/core/log.py` 统一出口：**只写文件与 stderr，绝不写 stdout**——
@@ -354,22 +412,41 @@ macOS 侧仍可用终端版对话框：`bash scripts/run-chat.sh`（`chat.jar`�
   截图 ─┬─ template 层：已知图标/固定元素 → Region(kind, source=template, 精确中心)
         ├─ yolo 层   ：UITag 分类控件 button/task/info/dialog/icon → 逐框 OCR 读区内文字
         ├─ general 层：通用检测找游戏实体（人物/NPC）→ Region(kind=entity, source=general)
+        ├─ option 层 ：顶层面板内的彩色文本行 → Region(kind=button, source=option)（对话框选项没底框）
         ├─ ocr 层    ：没被任何区域覆盖的文字 → 按「同行且水平相邻」聚成 label 兜底
-        └─ 融合去重（template > yolo > general > ocr，IoU ≥ 0.5 丢弃重叠）→ Region 列表 → 可点/只读分流
+        └─ 融合去重（template > yolo > general > option > ocr，IoU ≥ 0.5 丢弃重叠）→ Region 列表 → 可点/只读分流
   ```
 
   两级检测共用一套去重规则（见 `detect_layers`）：先跑 UITag，再跑通用模型；
   与 UITag 框 `IoU ≥ 0.5`、或中心点落在可点区域里（头像按钮之类）的实体框直接丢弃，
   其余作为 `kind=entity` 只读锚点——**不认领框内文字**，所以血条旁的怪物名照样进 `label` 层。
 
-  只有 `vision.clickable_kinds`（现阶段仅 `button`）里的区域会带编号 id 交给模型选，
-  其余区域只作为「类型: 内容」的只读信息供判断——所以模型不可能把正文里出现的「确定」二字当按钮点掉。
-  可点集合为空时按 `vision.empty_clickable_fallback` 降级为纯文本候选（等价改造前行为），不会空转停摆。
+  只有 `vision.clickable_kinds`（现阶段 `button` / `icon`）且来源在 `vision.clickable_sources`（默认
+  `["template", "yolo", "option"]`）里的区域会带编号 id 交给模型选，其余区域只作为「类型: 内容」的只读信息供判断
+  ——所以模型不可能把正文里出现的「确定」二字当按钮点掉。label 兜底层的文本行不作候选：看得见字不等于能点，
+  任务追踪的步骤描述、聊天正文都长得像按钮；icon 算可点，因为 HUD 上的背包/好友本来就是图标控件。
+  没有兜底提升：可点为空就如实报空（模型返回空 `choose` 等下一帧），而不是拿文本蒙一个坐标。
+  **顶层面板门控**（`vision.gate_by_top_layer`，默认开）：弹窗打开时客户端会先盖一层半透黑遮罩再画面板，
+  遮罩下的东西根本点不动，所以也不算候选。分层靠亮度双峰判：弹窗帧的网格亮度 p50=26 / p75=193（差 7 倍），
+  主场景只有 48 / 75（没分层）；取两簇几何中点当阈值，再按投影取连片矩形（投影能排掉窗口标题栏那种横贯
+  一条的亮带）。矩形之外的按钮降为只读上下文，且类型名写成「按钮（遮罩下·点不动）」——只把它挪进只读区不够，
+  类型名还挂着「按钮」时模型照样想选它。实测不门控时，对话框打开后模板仍以 0.99 命中遮罩下的 战斗教学/好友/实时，
+  模型对着背景连点 77 步画面纹丝不动。
+  **面板内彩色选项**（`vision.option_by_color`，默认开）：问道对话框的选项没有底框，能点的画彩色、纯说明的画白色，
+  所以靠字色分。判据是框内字身像元的饱和占比：实测同一帧选项 0.58-0.64、正文 0.12-0.13、NPC 名 0.22（差 4~5 倍），
+  阈值取 0.45；行高、宽高比都分不开（选项行和正文行一样高）。只在检到顶层面板时启用，面板外的彩色字（聊天频道、
+  任务追踪）一概不碰；已被模板/YOLO 认领的行不重复进候选；点击点取行中心。不做这件事，对话框里除了「离开」一个都
+  点不到——「【师门】师门任务」这类选项 UITag 只给一个占屏 36% 的 Visual_Elements/icon 大框，按容器规则被降级成 info，
+  等于没有可点信号。长期正道还是微调按钮权重（见下节），到时候把这个开关关掉回到「只认检测层」。
   排查融合效果用 `layout` 工具，直接返回当前画面的 `regions[{kind,source,text,box,cx,cy}]`。
 - **模板清单 + YOLO 区域分类**：模板不再由代码逐个查，而是 `template.items` 一张表
   （`{"file": "close_x.png", "kind": "button"}`），放图 + 加一行配置即生效，缺文件静默跳过；
   `scripts/crop_template.py --box x1,y1,x2,y2 --name close_x` 从 `debug/` 截图裁出模板并
   直接打印该往配置里加的那一行。模板项不单独声明「是否可点」，统一由 `kind` 决定。
+  主页面已标定 10 个按钮模板（`btn_*`）：好友 / 背包 / 展开 / 实时 / 道具商城 / 外卖商城 /
+  战斗教学 / 组队 / 接任务 / 师门任务——这些都是固定文案的功能按钮，裁的是文字本身
+  （背景只留 2px），换地图背景变了也照样命中。任务追踪的行（「与文殊天尊对话」这类）
+  文案随任务变化，不能做模板。
   YOLO 只做区域分类、不区分「保存还是取消」（语义由区内 OCR 给出），推荐权重
   `assets/models/yolo-ui.pt`（YOLO11s 在 GroundCUA 上微调，桌面截图 9 类，含 Button）。
   取权重不必走 HF（仓库 gated、要 token）：它随 `uitag` PyPI 包一起分发，
@@ -391,6 +468,28 @@ macOS 侧仍可用终端版对话框：`bash scripts/run-chat.sh`（`chat.jar`�
   `default_kind: "entity"` 决定未收录类别名归成 `entity`（只读锚点）。
   它和 UITag 是两个独立 `YoloDetector`：任一层权重缺失只影响自己，不会拖垮另一层；
   `detect` 工具用 `layer=all|ui|general` 可分别查看两层结果。
+- **按钮权重微调（失败案例驱动）**：模板管固定 HUD，动态界面（商城/背包/对话框/文案变化的
+  列表行）靠模型补；现用的 UITag 权重在本游戏上召回低（实测主页面 0 个 Button），所以留了一条
+  自训练通道——「可点候选为空」的画面就是当前识别链的盲区，自动存下来当训练数据。
+  1. **采集（自动）**：`daily_task` 循环里 `build_candidates` 返回空 → 画面存入
+     `debug/failed_shots/<时间戳>_<指纹8位>.png`，并追加 `index.jsonl`（ts/goal/区域数/
+     文字数/screen_key/路径）。去重用图像感知哈希：8x8 均值哈希 + 汉明距离 ≤ 12 算同一画面（实测同画面
+     帧间距离 0-6、不同画面 13-24），同一画面只存一张；不用区域文本集合当键——聊天频道一直在滚，
+     同一弹窗相邻 4 帧的文本 Jaccard 只有 0.50，拿它当键会把同一画面当成新画面反复存；
+     上限 `vision.max_failed_shots`（默认 300，到顶 warning 一次），开关
+     `vision.collect_failed_shots`。收集是旁路：任何失败只 warning，不影响决策主流程；
+     手动 `advise` 不收集（只收自动连续任务的失败画面）。
+  2. **预标注**：`python3 scripts/label_helper.py` —— 离线重跑四层融合，`source=template` 的
+     button 框直接写成 YOLO label，其余区域汇成 `datasets/ui/proposals.json` 待筛
+     （含 kind/text/box/方位）。筛掉聊天正文/玩家名/步骤描述、补图标按钮后，再用
+     X-AnyLabeling 打开 `datasets/ui/images` 抽查修正（建议至少 20 张再开训）。
+  3. **训练**：`python3 scripts/train_button_yolo.py` —— 80/20 确定性切分（每 5 张抽 1，
+     重跑不换验证集），COCO 预训练 yolo11n 起步、CPU 约 2~3 小时（MPS 在本机不可用）；
+     训完自动 `val`，达标线 button 召回 > 80%，best.pt 拷到 `assets/models/yolo-game-ui.pt`。
+  4. **接入**：`yolo.model_path` 改成 `assets/models/yolo-game-ui.pt` 后重启 mcpserver；
+     回退就是改回 `yolo-ui.pt`（原文件保留），真机用 `layout` 看 `source=yolo kind=button` 数量。
+  数据集 `datasets/ui/`：`images/` 与 `runs/` 已 gitignore（可由 failed_shots 重建），
+  `data.yaml` / `labels/` / `proposals.json` 入库保住筛选成果。
 - **人工接管即暂停**：鼠标被**人**移动或点击后，自动化立刻停手（不点击/不按键/不移动，也不推进流程），
   鼠标静止满 `human_guard.idle_resume_sec`（默认 10s）自动恢复。程序自身的移动/点击由
   `program_action()` 计数 + `program_grace_sec`（0.6s）宽限期滤掉，不会自己触发自己。
