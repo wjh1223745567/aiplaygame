@@ -51,6 +51,8 @@ public class LlmClient {
     private volatile String warnedFallback;
     /** 最近一次成功调用的模型：可能不是 llm.model（限流时降级到备用）。 */
     private volatile String modelUsed;
+    /** 上次已完整落盘的 system 内容哈希：同一份模板（含工具清单）不在每轮重复打全文。 */
+    private volatile int loggedSystemHash;
 
     public LlmClient(AiSettings settings) {
         this.settings = settings;
@@ -112,6 +114,7 @@ public class LlmClient {
         payload.put("messages", messages);
         payload.put("temperature", settings.temperature());
         payload.put("stream", false);
+        logRequest(model, messages);
 
         HttpRequest request = HttpRequest.newBuilder(URI.create(settings.apiBase() + "/chat/completions"))
                 .timeout(Duration.ofSeconds(Math.max(5, (long) settings.timeoutSeconds())))
@@ -149,6 +152,56 @@ public class LlmClient {
         for (JsonNode part : content) {
             if (part.path("type").asText("").equals("text")) {
                 sb.append(part.path("text").asText(""));
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 发送前把请求体记进日志：prompt 是决策质量的唯一输入，模型答得不对时第一手要看的就是它。
+     *
+     * <p>两条长度约束：截图（base64 十几万字符）只留占位；system（含全部工具描述，几千字）
+     * 内容未变时只打首次全量，否则一轮多步对话里同几千字会重复 6 遍。
+     */
+    private void logRequest(String model, List<Map<String, Object>> messages) {
+        if (!log.isInfoEnabled()) {
+            return;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (Map<String, Object> m : messages) {
+            String role = String.valueOf(m.get("role"));
+            String text = flatten(m.get("content"));
+            if ("system".equals(role)) {
+                int hash = text.hashCode();
+                if (hash == loggedSystemHash) {
+                    sb.append("\n  --- system --- [同前一条，共 ").append(text.length()).append(" 字]");
+                    continue;
+                }
+                loggedSystemHash = hash;
+            }
+            sb.append("\n  --- ").append(role).append(" ---\n  ")
+                    .append(text.replace("\n", "\n  "));
+        }
+        log.info("发送给模型 {}（{} 条消息）:{}", model, messages.size(), sb);
+    }
+
+    /** 消息内容拍平成文本：字符串直取；分段数组拼 text 段，截图只留占位。 */
+    private static String flatten(Object content) {
+        if (content instanceof String s) {
+            return s;
+        }
+        if (!(content instanceof List<?> parts)) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (Object p : parts) {
+            if (!(p instanceof Map<?, ?> part)) {
+                continue;
+            }
+            if ("image_url".equals(String.valueOf(part.get("type")))) {
+                sb.append("[截图已省略]");
+            } else if (part.get("text") != null) {
+                sb.append(part.get("text"));
             }
         }
         return sb.toString();

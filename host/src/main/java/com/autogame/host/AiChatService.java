@@ -326,13 +326,15 @@ public class AiChatService {
         }
     }
 
-    /** 用户消息：文字 +（可选）当前游戏截图，让视觉模型直接看画面。 */
+    /** 用户消息：文字 +（可选）当前游戏截图；默认不发图，让模型用 layout 拿识别结果。 */
     private Map<String, Object> userMessage(String text, boolean withVision) {
         List<Map<String, Object>> content = new ArrayList<>();
         // 每轮附一句轻提醒：是否动手由模型按用户意图自行判断，host 不再按关键词拦截
         content.add(Map.of("type", "text", "text", text
                 + "\n（提醒：按这句话的真实意图选工具——只是询问就用只读工具，"
-                + "明确要求动手才执行操作；拿不准就先只读，再在 reply 里问清楚。）"));
+                + "明确要求动手才执行操作；拿不准就先只读，再在 reply 里问清楚。）"
+                + (withVision ? "" : "\n（本轮没有附截图。需要看画面时调 layout 工具："
+                   + "它返回 YOLO + OCR 融合后的区域清单，含类型、文字、方位与坐标。）")));
         if (withVision) {
             String dataUrl = snapshotDataUrl();
             if (dataUrl != null) {

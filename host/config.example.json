@@ -9,6 +9,6 @@
     "max_image_side": 1024,
     "temperature": 0,
     "chat_max_rounds": 6,
-    "chat_vision": true
+    "chat_vision": false
   }
 }

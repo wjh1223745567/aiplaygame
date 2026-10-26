@@ -68,7 +68,8 @@ public class AiSettings {
         this.temperature = number(llm, "temperature", 0.0);
         this.maxImageSide = (int) number(llm, "max_image_side", 1024);
         this.maxRounds = (int) number(llm, "chat_max_rounds", 6);
-        this.visionByDefault = flag(llm, "chat_vision", true);
+        // 默认不发图：决策改用 layout 工具返回的 YOLO + OCR 融合清单（省 token、不依赖模型视觉能力）
+        this.visionByDefault = flag(llm, "chat_vision", false);
         if (!ready()) {
             log.warn("未配置 llm.api_key（host/config.json 或 LLM_API_KEY），对话模式将不可用");
         }
