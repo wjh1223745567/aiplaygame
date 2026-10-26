@@ -30,7 +30,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -45,16 +45,18 @@ DEFAULT_BASE = "https://open.bigmodel.cn/api/paas/v4"
 DEFAULT_MODEL = "glm-4v-flash"
 
 SYSTEM_PROMPT = (
-    "你是问道的老玩家兼自动决策器。你会收到：当前游戏截图 + 我方OCR已定位好的【可操作项清单】"
-    "(每项有编号 id 和文字)。请按「正常游戏策略」从清单中选出应点击的项(可多选、按点击顺序)。"
-    "重要：坐标由我方按 id 回填，你绝不输出坐标，也不得发明清单以外的文字；只输出一个JSON对象，无多余文字或代码围栏。"
+    "你是问道的老玩家兼自动决策器。你会收到：当前游戏截图 + 我方用「模板匹配 / YOLO 区域分类 / OCR」"
+    "三层融合定位好的文字，分成【可点击项】(带编号 id) 与【画面其他信息】(只读)两部分。"
+    "请按「正常游戏策略」从可点击项里选出应点击的 id(可多选、按点击顺序)。"
+    "\n【候选】只给可点击项编号，你只能从中选 id；画面其他信息单独列出，只作判断依据，不要试图点击；"
+    "也不得发明清单以外的文字。坐标由我方按 id 回填，你绝不输出坐标；只输出一个JSON对象，无多余文字或代码围栏。"
     "\n【输出字段】scene(main/dialog/battle/cutscene/panel/loading/other), reason(简短中文), "
     "choose(整数id数组，取自清单；无需点则空数组), "
     "other({\"action\":\"press|wait|none\",\"key\":\"esc|enter|space|tab\",\"sec\":秒}), "
     "done(目标已达成时true)。"
     "\n【正常游戏策略】"
     "\n1) 通用：始终朝「当前任务线索」推进，优先选最贴合目标、推进步数最少的项；同一次不要选多个相互冲突的项。"
-    "\n2) 主场景：优先点右侧「任务追踪」的「师门任务」等目标行(会自动寻路/交互)；若有「领取/签到/奖励」等可领项先领取；不要打开无关面板。"
+    "\n2) 主场景：优先点「任务追踪」里师门任务等目标行(会自动寻路/交互，此类行若出现在可点击项里才可点，否则按其他信息的文字线索判断)；若有「领取/签到/奖励」等可领项先领取；不要打开无关面板。"
     "\n3) 对话：选能推进剧情的选项——优先与任务目标对应的NPC/给予/继续/前进/确定/传送；绝不选 放弃/取消/拒绝/不接/离开/下次再说。"
     "\n4) 战斗：优先选「自动/自动战斗」挂机；否则攻击与任务相关的怪/主怪；不要点 逃跑/防御/无关技能；战斗结束后清理奖励弹窗。"
     "\n5) 面板/弹窗：领完奖励后关闭(点 关闭/确定)；不在无关界面久留。"
@@ -88,40 +90,76 @@ def _img_to_data_url(img: np.ndarray, max_side: int = 1024) -> str:
     return f"data:image/jpeg;base64,{b64}"
 
 
-def _ocr_hint(results, limit: int = 60) -> str:
-    """把 OCR 结果整理成给模型的文本清单：text @(x,y)。"""
-    lines: List[str] = []
-    for r in sorted(results, key=lambda x: (x.cy, x.cx))[:limit]:
-        t = r.text.replace("\n", " ").strip()
-        if t:
-            lines.append(f"{t} @({r.cx:.0f},{r.cy:.0f})")
-    return "\n".join(lines)
+# 区域类型的中文名：只读上下文按「类型: 内容」渲染给模型
+_KIND_CN = {"button": "按钮", "icon": "图标", "task": "任务",
+            "dialog": "弹窗", "info": "信息", "label": "文本"}
 
 
-def collect_candidates(results, max_n: int = 40) -> List[dict]:
-    """把 OCR 结果转为带编号的可操作项 [{'id','text','x','y'}]（按行阅读序、去重）。
+def _region_text(region) -> str:
+    """区域的可读文字：优先区内 OCR，模板区域没有文字就用模板名兜底。"""
+    text = (region.text or "").strip()
+    if text:
+        return text
+    name = (region.meta or {}).get("template")
+    return str(name) if name else _KIND_CN.get(region.kind, region.kind)
 
-    这是“先标注后决策”的核心：坐标由我方掌敓，模型只按 id 选。"""
-    seen = set()
+
+def _region_click_point(region) -> Tuple[int, int]:
+    """点击点只由我方区域给出：模板命中中心 → 区内文字中心 → 框中心。"""
+    if region.points:
+        x, y = region.points[0]
+        return int(x), int(y)
+    return region.center
+
+
+def build_candidates(regions, clickable_kinds=("button",), fallback: bool = True,
+                     max_n: int = 40) -> Tuple[List[dict], List[str]]:
+    """把融合后的区域拆成 (可点候选带 id, 只读上下文文本)。坐标只由我方产生。
+
+    只有 `kind in clickable_kinds` 的区域才进候选并分配 id——信息/弹窗正文/任务追踪
+    这类区域没有 id，模型不可能把它们点掉（这正是「正文里的『确定』二字被点」的根因修法）。
+    `fallback=True` 时可点集合为空（模板未标定、YOLO 未训练、画面确实没有按钮），
+    把 `label` 区域整体提升为可点候选，等价于改造前的纯文本候选，避免流程空转停摆。
+    """
+    kinds = {str(k) for k in (clickable_kinds or ())}
+    clickable = [r for r in regions if r.kind in kinds]
+    readonly = [r for r in regions if r.kind not in kinds]
+    if not clickable and fallback:
+        promoted = [r for r in readonly if r.kind == "label"]
+        if promoted:
+            _log.info("可点项为空，降级为纯文本候选（%d 项）", len(promoted))
+            clickable = promoted
+            readonly = [r for r in readonly if r.kind != "label"]
     cands: List[dict] = []
-    for r in sorted(results, key=lambda x: (round(x.cy / 12), x.cx)):
-        t = (r.text or "").replace("\n", " ").strip()
-        if not t:
-            continue
-        key = (t, round(r.cx), round(r.cy))
-        if key in seen:
+    seen = set()
+    for r in clickable:
+        text = _region_text(r)
+        x, y = _region_click_point(r)
+        key = (text, x, y)
+        if not text or key in seen:
             continue
         seen.add(key)
-        cands.append({"id": len(cands) + 1, "text": t,
-                      "x": round(r.cx), "y": round(r.cy)})
+        cands.append({"id": len(cands) + 1, "text": text, "x": x, "y": y,
+                      "kind": r.kind, "source": r.source})
         if len(cands) >= max_n:
             break
-    return cands
+    context: List[str] = []
+    for r in readonly:
+        # YOLO 区域常常只有类别、区内没文字（图标/工具栏/面板）：这种行没有信息量，
+        # 只会把 prompt 塞满「信息: 信息」，直接不写。模板区域保留名字方便排查。
+        if not (r.text or "").strip() and not (r.meta or {}).get("template"):
+            continue
+        text = _region_text(r)
+        if text:
+            context.append(f"{_KIND_CN.get(r.kind, r.kind)}: {text}")
+    return cands, context
 
 
 def _candidates_hint(cands: List[dict]) -> str:
-    """生成给模型的编号选项清单：[id] text（不给坐标）。"""
-    return "\n".join(f"[{c['id']}] {c['text']}" for c in cands)
+    """生成给模型的编号选项清单：[id] (类型) text（不给坐标）。"""
+    return "\n".join(
+        f"[{c['id']}] ({_KIND_CN.get(c.get('kind', ''), c.get('kind') or '项')}) {c['text']}"
+        for c in cands)
 
 
 def _extract_json(text: str) -> Optional[dict]:
@@ -159,6 +197,7 @@ class Advisor:
     """大模型决策助手。cfg 为整份 config dict，读取其中的 llm 段。"""
 
     def __init__(self, cfg: dict):
+        self.cfg = cfg
         llm = cfg.get("llm", {})
         self.enabled: bool = bool(llm.get("enabled", True))
         self.base: str = (llm.get("api_base") or DEFAULT_BASE).rstrip("/")
@@ -167,6 +206,19 @@ class Advisor:
         self.timeout: float = float(llm.get("timeout", 30))
         self.max_side: int = int(llm.get("max_image_side", 1024))
         self.temperature: float = float(llm.get("temperature", 0.0))
+
+    # ---------- 视觉分流配置（config.vision） ----------
+    @property
+    def clickable_kinds(self) -> List[str]:
+        """哪些区域类型可以进入可点候选。现阶段只有 button。"""
+        vision = self.cfg.get("vision", {}) or {}
+        return list(vision.get("clickable_kinds") or ["button"])
+
+    @property
+    def empty_fallback(self) -> bool:
+        """可点集合为空时是否降级为纯文本候选（等价于改造前行为）。"""
+        vision = self.cfg.get("vision", {}) or {}
+        return bool(vision.get("empty_clickable_fallback", True))
 
     # ---------- 底层调用 ----------
     def _chat(self, user_text: str, img: Optional[np.ndarray]) -> str:
@@ -221,22 +273,28 @@ class Advisor:
         return text
 
     # ---------- 业务封装 ----------
-    def choose(self, img: np.ndarray, candidates: List[dict], goal: str = "") -> dict:
+    def choose(self, img: np.ndarray, candidates: List[dict], goal: str = "",
+               context: Optional[List[str]] = None) -> dict:
         """先标注后决策：把已编号的 candidates 交给模型，返回它选中的 id。
 
-        返回 dict：{scene, reason, choose:[合法id], other, done}。坐标不经模型。
+        candidates 只含可点击项（带 id）；context 是只读上下文（任务追踪/提示/弹窗正文），
+        不带 id，只供模型判断。返回 dict：{scene, reason, choose:[合法id], other, done}。坐标不经模型。
         每次调用都把「模型原始输出 + 判断结果」写进项目根的 ai-decisions.log（source=mcpserver）。
         """
+        context = list(context or [])
+        context_hint = "\n".join(context) or "（无）"
         user = (
             f"目标：{goal or '推进当前任务'}\n\n"
-            f"可操作项清单（只能从中选 id，不要发明新文字）：\n"
-            f"{_candidates_hint(candidates) or '（无可操作项）'}\n\n"
+            f"可点击项（只能从这些里选 id，不要发明新文字）：\n"
+            f"{_candidates_hint(candidates) or '（无可点击项）'}\n\n"
+            f"画面其他信息（只读，用于判断，不要选）：\n"
+            f"{context_hint}\n\n"
             "请返回JSON。"
         )
         started = time.time()
         lines = [
             f"{decision_log.stamp()}  source=mcpserver  model={self.model}"
-            f"  候选 {len(candidates)} 项",
+            f"  可点 {len(candidates)} 项  只读 {len(context)} 项",
             f"目标：{decision_log.one_line(goal or '推进当前任务')}",
         ]
         try:
@@ -277,11 +335,14 @@ class Advisor:
         decision_log.write(lines)
         return data
 
-    def advise(self, img: np.ndarray, results, goal: str) -> dict:
-        """兼容旧接口：先 collect_candidates 标注，再 choose 选择，最后把选中 id
-        回写为 actions（click_point 用我方精确像素坐标），便于 execute_actions 直接跑。"""
-        cands = collect_candidates(results)
-        data = self.choose(img, cands, goal)
+    def advise(self, img: np.ndarray, regions, goal: str) -> dict:
+        """只给建议不执行：融合区域 → 可点/只读分流 → choose 选 id → 回写 actions。
+
+        返回集内除 scene/reason/done 外，`clickable` 是带 id 的可点候选，`context` 是
+        只读上下文行；actions 里的 click_point 用的是我方区域坐标，模型没参与坐标。
+        """
+        cands, context = build_candidates(regions, self.clickable_kinds, self.empty_fallback)
+        data = self.choose(img, cands, goal, context=context)
         cmap = {c["id"]: c for c in cands}
         acts = [{"action": "click_point", "x": cmap[i]["x"], "y": cmap[i]["y"]}
                 for i in data["choose"] if i in cmap]
@@ -289,21 +350,23 @@ class Advisor:
         if isinstance(other, dict) and (other.get("action") or "").lower() in ("press", "wait"):
             acts.append(other)
         data["actions"] = acts
-        data["candidates"] = cands
+        data["clickable"] = cands
+        data["context"] = context
         return data
 
-    def decide_dialog(self, img: np.ndarray, results, hint: str = "") -> Optional[dict]:
-        """对话专用（标注后选择）：返回我方清单中真实存在的选项文字，供 click_text 安全点击。"""
-        cands = collect_candidates(results)
+    def decide_dialog(self, img: np.ndarray, regions, hint: str = "") -> Optional[dict]:
+        """对话专用（区域分流后选择）：返回我方区域清单中真实存在的选项，供安全点击。"""
+        cands, context = build_candidates(regions, self.clickable_kinds, self.empty_fallback)
         try:
-            data = self.choose(img, cands, hint or "推进对话/任务")
+            data = self.choose(img, cands, hint or "推进对话/任务", context=context)
         except LlmError:
             return None
         cmap = {c["id"]: c for c in cands}
         for cid in data.get("choose") or []:
             c = cmap.get(cid)
             if c:
-                return {"action": "click_text", "text": c["text"]}
+                # 用我方区域坐标点击：模板命中中心比「按文字重新 OCR 一次」更稳
+                return {"action": "click_point", "x": c["x"], "y": c["y"]}
         return None
 
 
@@ -352,8 +415,8 @@ def execute_actions(ctx, actions: List[dict], img_shape) -> int:
 def run_advisor_loop(ctx, goal: str = "", max_steps: int = 120,
                      idle_limit: int = 4, step_pause: Optional[float] = None) -> int:
     """纯「识别 → 大模型决策 → 执行」连续循环（先标注后决策）：
-      每轮 snapshot -> collect_candidates 标注
-      -> advisor.choose 选 id -> execute_choice 用我方坐标回填点击。
+      每轮 snapshot -> ctx.analyze 三层融合出区域 -> build_candidates 分流可点/只读
+      -> advisor.choose 只从可点项选 id -> execute_choice 用我方坐标回填点击。
     直到 done / 连续无动作 / 达到 max_steps / 被急停。返回实际轮数。
     节奏参数（step_pause / idle_pause / click_pause）由 config.timing 控制，默认已调快。
     """
@@ -373,16 +436,33 @@ def run_advisor_loop(ctx, goal: str = "", max_steps: int = 120,
     trail: list = []               # 最近若干轮的 (screen_key, 选中文字tuple)
     TRAIL_MAX = 8
 
-    def _screen_key(cs):
-        return frozenset(c["text"] for c in cs)
+    def _screen_key(rs):
+        """画面指纹用全部区域文本（识别画面不能只看按钮），模板区域用模板名补位。"""
+        marks = set()
+        for r in rs:
+            if r.text:
+                marks.add(r.text)
+            elif (r.meta or {}).get("template"):
+                marks.add("@" + str(r.meta["template"]))
+        return frozenset(marks)
 
     while steps < max_steps and not user_input.is_stopped():
+        # 人工接管中则在这里等（等不到就整轮结束，绝不带着用户操作状态去点鼠标）
+        if not ctx.guard():
+            _log.warning("人工接管等待被中断，结束循环")
+            break
+        # 记下本轮开始时的暂停代次：算完候选后若已变化，说明期间被人接管过，
+        # 暂停前的截图与坐标全部作废，必须重新感知一轮。
+        gen = ctx.guard_generation()
         steps += 1
         img, results = ctx.snapshot()
-        cands = collect_candidates(results)
+        # 三层融合（模板 → YOLO → OCR）后再分流：只有 button 类区域带 id 可点，其余只读
+        regions = ctx.analyze(img, results)
+        clickable, context = build_candidates(regions, ctx.advisor.clickable_kinds,
+                                             ctx.advisor.empty_fallback)
         # 绕圈规避：若本画面是曾经到过的画面(说明绕回来了)，就把"导致绕回来的上一步
         # 选择"在它所属画面内暂时避开，下次该画面改选下一个选项——而不是排除重复项。
-        key = _screen_key(cands)
+        key = _screen_key(regions)
         prev_keys = [k for (k, _) in trail]
         if key in prev_keys and trail:
             last_key, last_texts = trail[-1]
@@ -392,19 +472,19 @@ def run_advisor_loop(ctx, goal: str = "", max_steps: int = 120,
                           list(last_texts))
                 del trail[:prev_keys.index(key) + 1]
         tried = tried_by_screen.get(key, set())
-        advance = [c for c in cands if c["text"] not in tried]
+        advance = [c for c in clickable if c["text"] not in tried]
         if not advance:
             # 本画面选项已轮完一轮：清空记录允许回头再点（不永久排除重复项）
             tried_by_screen[key] = set()
             tried = set()
-            advance = list(cands)
+            advance = list(clickable)
         task_ctx = ""
         if tried:
             task_ctx = (f"｜注意：本画面这些选项之前选了会绕回来："
                         f"{sorted(tried)}，"
                          "请从剩余没试过的选项里选一个能真正推进任务的不同选项")
         try:
-            plan = ctx.advisor.choose(img, advance, goal + task_ctx)
+            plan = ctx.advisor.choose(img, advance, goal + task_ctx, context=context)
         except LlmError as e:
             _log.error("大模型调用失败，结束循环: %s", e)
             break
@@ -415,8 +495,11 @@ def run_advisor_loop(ctx, goal: str = "", max_steps: int = 120,
         if plan.get("done"):
             _log.info("大模型目标已达成，结束循环（%d 轮）", steps)
             break
+        if ctx.guard_generation() != gen:
+            _log.info("暂停期间画面已变，丢弃本轮候选重新感知")
+            continue
         clicked_texts = [c["text"] for c in picked if c]
-        executed = execute_choice(ctx, advance, plan)
+        executed = execute_choice(ctx, advance, plan, generation=gen)
         if executed:
             idle = 0
             # 记录本轮(画面, 选中项)：下一轮若回到旧画面即可据此定位"该换的下一步"
@@ -438,16 +521,23 @@ def cmap_find(cands, cid):
     return next((c for c in cands if c["id"] == cid), None)
 
 
-def execute_choice(ctx, candidates: List[dict], plan: dict) -> int:
+def execute_choice(ctx, candidates: List[dict], plan: dict,
+                   generation: Optional[int] = None) -> int:
     """按模型选中的 id 回填我方坐标并执行；返回实际执行次数。
 
-    这是“模型只选、坐标由我们定”的关键：不信任模型输出的任何像素。"""
+    这是“模型只选、坐标由我们定”的关键：不信任模型输出的任何像素。
+    generation 不为 None 时，每次点击前比对一次：不一致说明期间被人工接管，
+    暂停前算出的坐标已不属于当前画面，立即中止剩余动作。
+    """
     import time
     from ..core import input as user_input
     cmap = {c["id"]: c for c in candidates}
     executed = 0
     for cid in plan.get("choose") or []:
         if user_input.is_stopped():
+            break
+        if generation is not None and ctx.guard_generation() != generation:
+            _log.info("点击前检测到画面代次变化（人工接管），中止本轮剩余动作")
             break
         c = cmap.get(cid)
         if not c:

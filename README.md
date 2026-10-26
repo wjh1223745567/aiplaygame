@@ -34,10 +34,10 @@ autogame/
 │   ├── config.json                # 游戏侧配置（窗口/截图/输入/OCR/模板/YOLO）
 │   ├── config.example.json        # 同上模板
 │   ├── game_mcp/
-│   │   ├── server.py              # MCPServer("wendao-game") + 15 个 @tool（统一埋点）
+│   │   ├── server.py              # MCPServer("wendao-game") + 17 个 @tool（统一埋点）
 │   │   ├── config.py              # 读 mcpserver/config.json，并合并 host/config.json 的 llm
 │   │   ├── core/                  # 窗口 / 截图 / 输入 / 引擎 / 运行日志(log) / 判断日志(decision_log)
-│   │   ├── vision/                # OCR / 模板匹配 / YOLO / LLM 决策
+│   │   ├── vision/                # 三层融合(screen) / OCR / 模板匹配 / YOLO / LLM 决策
 │   │   └── tools/                 # game.py(open_game/login/close_game) daily.py(师门任务/扫货)
 │   ├── requirements.txt
 │   └── smoke_test.py              # Python 侧 stdio 冒烟
@@ -47,7 +47,8 @@ autogame/
 │   ├── run-host.sh          # 按需构建并运行 host（源文件比 jar 新就重构建）
 │   ├── run-chat.sh          # 对话调试台（构建并运行 mcpclient/target/chat.jar）
 │   ├── run-mcpserver.sh     # 以 Streamable HTTP 常驻 mcpserver（容器化 host 用）
-│   └── build-client-win.sh  # 打 Windows 便携客户端（client.jar + JRE + bat -> zip）
+│   ├── build-client-win.sh  # 打 Windows 便携客户端（client.jar + JRE + bat -> zip）
+│   └── crop_template.py     # 从 debug/ 截图裁 UI 模板图 -> assets/templates/<name>.png
 ├── assets/                  # 模板图、YOLO 权重（与 mcpserver 共用）
 ├── ai-decisions.log          # 运行时生成：大模型每次判断的日志（已 gitignore）
 ├── mcpserver.log             # 运行时生成：mcpserver 工具调用/动作/异常日志（已 gitignore）
@@ -277,13 +278,49 @@ macOS 侧仍可用终端版对话框：`bash scripts/run-chat.sh`（`chat.jar`�
 
 ## 7. 说明与约定
 
-- **工具清单（16）**：`ping`、`list_windows`、`capture`、`ocr`、`detect`、`click_point`、
+- **工具清单（17）**：`ping`、`list_windows`、`capture`、`ocr`、`layout`、`detect`、`click_point`、
   `click_text`、`press_key`、`advise`、`open_game`、`close_game`、`game_status`、`login`、
   `back_to_main`、`daily_task`、`market_scan`。
 - **工具描述就是提示词**：每个工具的使用场景、触发说法、是否真实操作、返回字段都写在
   `mcpserver/game_mcp/server.py` 的 docstring 里（MCP 会把它当 description 透给模型）；
   host 的 `SYSTEM_PROMPT` 只保留对话协议（JSON 格式、tool/reply 二选一、失败两次停手），
   不再重复工具细节。新增工具时只需在 Python 侧写清描述，Java 不用同步。
+- **三层视觉流水线**（`vision/screen.py`，模板优先）：
+
+  ```
+  截图 ─┬─ template 层：已知图标/固定元素 → Region(kind, source=template, 精确中心)
+        ├─ yolo 层   ：UI 区域分类 button/task/info/dialog/icon → 逐框 OCR 读区内文字
+        ├─ ocr 层    ：没被任何区域覆盖的文字 → 按「同行且水平相邻」聚成 label 兜底
+        └─ 融合去重（template > yolo > ocr，IoU ≥ 0.5 丢弃重叠）→ Region 列表 → 可点/只读分流
+  ```
+
+  只有 `vision.clickable_kinds`（现阶段仅 `button`）里的区域会带编号 id 交给模型选，
+  其余区域只作为「类型: 内容」的只读信息供判断——所以模型不可能把正文里出现的「确定」二字当按钮点掉。
+  可点集合为空时按 `vision.empty_clickable_fallback` 降级为纯文本候选（等价改造前行为），不会空转停摆。
+  排查融合效果用 `layout` 工具，直接返回当前画面的 `regions[{kind,source,text,box,cx,cy}]`。
+- **模板清单 + YOLO 区域分类**：模板不再由代码逐个查，而是 `template.items` 一张表
+  （`{"file": "close_x.png", "kind": "button"}`），放图 + 加一行配置即生效，缺文件静默跳过；
+  `scripts/crop_template.py --box x1,y1,x2,y2 --name close_x` 从 `debug/` 截图裁出模板并
+  直接打印该往配置里加的那一行。模板项不单独声明「是否可点」，统一由 `kind` 决定。
+  YOLO 只做区域分类、不区分「保存还是取消」（语义由区内 OCR 给出），推荐权重
+  `assets/models/uitag-yolo11s-ui-detect-v1.pt`（YOLO11s 微调、桌面截图 9 类，含 Button）。
+  模型类别名（`Button` / `Icon` / `Text` …）与内部 kind 不是一回事，检测后先查
+  `yolo.class_map` 再查内置 `CLASS_MAP` 归一化成 button/icon/label/dialog/info/task；
+  未收录的类别降成 `info`（只读锚点，不会被点）并且只 warning 一次——按提示补一行
+  `"class_map": {"Checkbox": "button"}` 就能改正，换模型不用改代码。
+  `yolo.imgsz` 默认 1280：UI 元素普遍很小，640 会把 25px 的按钮缩成 10px、召回明显掉。
+  权重缺失时该层直接禁用并记 `_load_error`、**不回退 COCO**
+  （COCO 的 person/car 当 UI 用只会坑下游），除非显式设 `yolo.allow_pretrained_fallback=true`。
+  面积超过整图 35% 的框一律当容器：不参与可点、也不认领框内文字，
+  避免「整屏一个窗口框」把 OCR 全吃进 `info`、使 `label` 兜底层失效导致流程空转。
+- **人工接管即暂停**：鼠标被**人**移动或点击后，自动化立刻停手（不点击/不按键/不移动，也不推进流程），
+  鼠标静止满 `human_guard.idle_resume_sec`（默认 10s）自动恢复。程序自身的移动/点击由
+  `program_action()` 计数 + `program_grace_sec`（0.6s）宽限期滤掉，不会自己触发自己。
+  暂停期间用户可能已经点了别的界面，所以恢复后会丢弃暂停前算出的候选重新感知（`generation` 比对）。
+  `game_status` 返回 `paused` / `resume_in_sec`；其他工具在暂停中最多阻塞 `human_guard.max_block_sec`
+  （默认 30s）后返回 `paused=true`，避免短工具表现成卡死（`ping`/`list_windows`/`game_status` 立即返回）。
+  该保护依赖 macOS「辅助功能/输入监控」权限，与合成键鼠同生共死；F12 急停由 `server.main()` 启动时
+  注册（幂等，以前该热键从未生效）。
 - **登录自动检测**：`login` 先用窗口列表（含最小化/其他桌面的窗口）判断游戏是否已打开；
   未打开则按 `auto_open=true` 自动 `open` 客户端并等待窗口；已在主场景时跳过点击直接返回
   `already_in_game`。登录按钮兼容「进入游戏」「登录游戏」两种客户端文案。登录页与登录过程中
@@ -308,7 +345,8 @@ macOS 侧仍可用终端版对话框：`bash scripts/run-chat.sh`（`chat.jar`�
 - **onnxruntime 钉版本**：1.21.1 是 macOS 13.0 上可用的最后一版（1.23+ 的 wheel 按 13.4 构建会缺 libc++ 符号）。
 - **配置分两份**（均在各自模块下，模板见同目录 `config.example.json`）：
   - `host/config.json`：`llm` 段（api_base / api_key / model / 超时 / 轮数 / 附图）；含密钥，已 gitignore。
-  - `mcpserver/config.json`：`window` / `capture` / `input` / `timing` / `ocr` / `template` / `yolo`。
+  - `mcpserver/config.json`：`window` / `capture` / `input` / `human_guard` / `timing` / `ocr` /
+    `template` / `vision` / `yolo`。
 
   Python 侧 `config.py` 读游戏配置时会自动把 `host/config.json` 的 `llm` 段合并进来，
   所以 `Advisor(cfg)` 等读 `cfg["llm"]` 的代码不变；密钥只存一处。可用环境变量覆盖：

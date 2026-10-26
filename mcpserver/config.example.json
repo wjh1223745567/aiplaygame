@@ -14,6 +14,14 @@
     "move_duration_sec": 0.18,
     "stop_hotkey": "f12"
   },
+  "human_guard": {
+    "enabled": true,
+    "idle_resume_sec": 10,
+    "program_grace_sec": 0.6,
+    "max_pause_sec": 0,
+    "max_block_sec": 30,
+    "watch_clicks": true
+  },
   "timing": {
     "step_pause": 0.4,
     "click_pause": 0.2,
@@ -26,12 +34,28 @@
   },
   "template": {
     "templates_dir": "assets/templates",
-    "default_threshold": 0.85
+    "default_threshold": 0.85,
+    "multi_scale": true,
+    "items": {
+      "close_x":   {"file": "close_x.png",   "kind": "button"},
+      "confirm":   {"file": "confirm.png",   "kind": "button"},
+      "cancel":    {"file": "cancel.png",    "kind": "button"},
+      "task_row":  {"file": "task_row.png",  "kind": "task"},
+      "dialog_bg": {"file": "dialog_bg.png", "kind": "dialog"},
+      "bag_icon":  {"file": "bag.png",       "kind": "icon"}
+    }
+  },
+  "vision": {
+    "clickable_kinds": ["button"],
+    "empty_clickable_fallback": true
   },
   "yolo": {
-    "enabled": false,
-    "model_path": "assets/models/yolo11s.pt",
-    "conf_threshold": 0.5,
-    "device": "cpu"
+    "enabled": true,
+    "model_path": "assets/models/uitag-yolo11s-ui-detect-v1.pt",
+    "conf_threshold": 0.4,
+    "device": "cpu",
+    "imgsz": 1280,
+    "ui_classes": ["button", "task", "info", "dialog", "icon"],
+    "class_map": {}
   }
 }

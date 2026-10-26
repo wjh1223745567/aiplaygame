@@ -1,7 +1,7 @@
 """问道游戏自动化 · MCP Server 入口（MCPServer）。
 
 通过 MCP 暴露两类工具：
-  · 基础能力：ping / list_windows / capture / ocr / detect / click_point /
+  · 基础能力：ping / list_windows / capture / ocr / layout / detect / click_point /
              click_text / press_key / advise
   · 游戏功能：open_game / close_game / game_status / login / back_to_main / daily_task / market_scan（见 tools/）
 
@@ -28,8 +28,8 @@ from .core import capture as cap
 from .core import log as runlog
 from .core import input as user_input
 from .core.engine import BotContext
+from .core.human_guard import get_guard
 from .core.window import find_game_window, list_windows as _list_windows
-from .vision.ocr import ocr_image
 from .vision.yolo import YoloDetector
 from .tools import game as game_tools
 from .tools import daily as daily_tools
@@ -41,6 +41,28 @@ log = runlog.get_logger("server")
 
 def _ms(started: float) -> int:
     return int((time.perf_counter() - started) * 1000)
+
+
+# 豁免名单：不查暂停、永远立即返回。模型看到 paused 就知道该等，而不是重试狂点。
+_PAUSE_EXEMPT = frozenset({"ping", "list_windows", "game_status"})
+
+
+def _pause_block(name: str):
+    """工具入口统一查人工接管暂停。返回 None 表示可以继续，否则返回提示 dict。
+
+    用 max_block_sec 封顶（默认 30s）：长流程（daily_task）本来就阻塞，等 10s 无妨；
+    但 ocr / click_point 这类短工具若阻塞太久，客户端会以为是卡死。
+    """
+    if name in _PAUSE_EXEMPT:
+        return None
+    try:
+        guard = get_guard(cfgmod.load_config().get("human_guard", {}))
+    except Exception:  # noqa: BLE001 配置读不到也不能阻住工具
+        guard = get_guard()
+    if guard.wait_if_paused(guard.max_block_sec):
+        return None
+    return {"ok": False, "paused": True, "resume_in_sec": round(guard.resume_in(), 1),
+            "error": f"检测到人工操作，自动化已暂停；鼠标静止 {guard.idle_resume_sec:.0f}s 后自动恢复"}
 
 
 def tool(fn):
@@ -58,7 +80,11 @@ def tool(fn):
 
 
 def _traced(fn):
-    """给工具函数套一层日志：一次调用一条日志，异常先留痕再原样抛出。"""
+    """给工具函数套一层日志：一次调用一条日志，异常先留痕再原样抛出。
+
+    入口统一检查人工接管暂停：短工具（ocr/click_point 等）最多阻塞 max_block_sec，
+    超时直接返回 paused=true，避免客户端表现为“卡死”。
+    """
     sig = inspect.signature(fn)
     name = fn.__name__
 
@@ -69,6 +95,11 @@ def _traced(fn):
         except TypeError:  # 参数绑定失败也要留痕，再让原函数自己报错
             shown = runlog.brief({"args": args, "kwargs": kwargs}, 240)
         started = time.perf_counter()
+        blocked = _pause_block(name)
+        if blocked is not None:
+            log.warning("工具 %s 因人工操作暂停而跳过 %dms 参数=%s",
+                        name, _ms(started), shown)
+            return blocked
         try:
             result = fn(*args, **kwargs)
         except Exception as e:  # noqa: BLE001 照旧抛给 MCP，但先留痕
@@ -150,10 +181,11 @@ def capture(tag: str = "capture") -> dict:
 
 
 @tool
-def ocr(keyword: Optional[str] = None) -> dict:
+def ocr(keyword: Optional[str] = None, region: Optional[List[int]] = None) -> dict:
     """需要知道画面里有哪些文字、或拿文字坐标去点击时用：返回 count 与 texts[{text,confidence,box,cx,cy}]。
 
     keyword 非空时只保留包含该词的文本（比较时忽略空格，“师门任务”能命中“师门 任务”）。
+    region 传 [x1,y1,x2,y2] 时只识别该区域（弹窗/面板内部），坐标仍回换算到整图。
     只读无副作用；cx/cy 可直接喂给 click_point，点击前不确定目标在哪就先 ocr。
     """
     try:
@@ -161,7 +193,7 @@ def ocr(keyword: Optional[str] = None) -> dict:
     except RuntimeError as e:
         return _err(str(e))
     img = ctx.grab()
-    results = ocr_image(img, min_confidence=ctx.ocr_min_conf)
+    results = ctx.ocr(img, region=region)
     if keyword:
         results = [r for r in results if keyword in r.text.replace(" ", "")]
     return _ok(count=len(results), texts=[
@@ -172,12 +204,35 @@ def ocr(keyword: Optional[str] = None) -> dict:
 
 
 @tool
-def detect(classes: Optional[List[str]] = None) -> dict:
-    """OCR 读不出图标类按钮、需要按图案找目标时用：YOLO 检测返回 count 与
-    detections[{label,confidence,box,cx,cy}]。
+def layout() -> dict:
+    """需要查看当前画面被分成哪些区域（按钮/任务/信息/弹窗）时用：返回 count 与
+    regions[{kind,source,text,box,cx,cy,confidence}]。
 
-    classes 非空时只保留 label 完全相同的检测（区分大小写），为空则返回全部类别；
-    模型加载失败返回 ok=false。只读无副作用。
+    kind 取 button/icon/task/dialog/info/label，source 取 template/yolo/ocr；
+    只有 kind=button 的区域会被当作可点击项，其余只是供判断的只读信息。
+    只读无副作用；模板与 YOLO 都未就绪时等价于 OCR 按行聚合的文本（source=ocr）。
+    """
+    try:
+        ctx = _make_ctx()
+    except RuntimeError as e:
+        return _err(str(e))
+    regions = ctx.analyze()
+    return _ok(count=len(regions), regions=[
+        {**r.to_dict(), "confidence": round(r.confidence, 3)} for r in regions
+    ])
+
+
+@tool
+def detect(classes: Optional[List[str]] = None) -> dict:
+    """OCR 读不出图标类按钮、需要按图案找 UI 区域时用：返回 count、model_classes
+    （权重支持的全部类别名）与 detections[{label,kind,confidence,box,cx,cy}]。
+
+    classes 非空时只保留匹配的检测：既可写模型原始类别名（Button / Icon），也可写内部
+    kind（button / icon / info / dialog / task / label），不区分大小写；为空则用配置的
+    ui_classes。kind 是归一化后的内部类型，决定该区域是否可点（由 vision.clickable_kinds
+    决定，现阶段仅 button），未收录的类别名一律按 info 处理。
+    本层只做区域分类，不区分按钮语义（保存还是取消由区内 OCR 文字给出）。
+    权重缺失（assets/models/uitag-yolo11s-ui-detect-v1.pt）时返回 ok=false。只读无副作用。
     """
     try:
         cfg = cfgmod.load_config()
@@ -188,11 +243,11 @@ def detect(classes: Optional[List[str]] = None) -> dict:
         ycfg = dict(cfg.get("yolo", {}))
         ycfg["enabled"] = True
         det = YoloDetector(ycfg)
-        dets = det.detect(img, classes=classes)
+        dets = det.detect_ui(img, classes=classes)
         if det._load_error:
             return _err(f"YOLO 加载失败: {det._load_error}")
-        return _ok(count=len(dets), detections=[
-            {"label": d.label, "confidence": round(d.confidence, 3),
+        return _ok(count=len(dets), model_classes=det.class_names, detections=[
+            {"label": d.label, "kind": d.kind, "confidence": round(d.confidence, 3),
              "box": list(d.box), "cx": round(d.cx), "cy": round(d.cy)}
             for d in dets
         ])
@@ -250,9 +305,10 @@ def press_key(key: str, dry_run: bool = False) -> dict:
 
 @tool
 def advise(goal: str = "", dry_run: bool = True) -> dict:
-    """只想让视觉模型给一步建议、不执行任何动作时用：返回 scene/reason/done/actions/candidates。
+    """只想让视觉模型给一步建议、不执行任何动作时用：返回 scene/reason/done/actions/clickable/context。
 
     goal 是本次目标（为空按“推进当前任务”），必须来自用户原话。要真正连续推进用 daily_task。
+    clickable 是带 id 的可点项（现阶段只有按钮类区域），context 是只读画面信息，模型只能从 clickable 选 id。
     dry_run 对 advise 无实际影响（它从不点击）。
     """
     try:
@@ -265,12 +321,13 @@ def advise(goal: str = "", dry_run: bool = True) -> dict:
     img = ctx.grab()
     results = ctx.ocr(img)
     try:
-        plan = ctx.advisor.advise(img, results, goal=goal or "推进当前任务")
+        plan = ctx.advisor.advise(img, ctx.analyze(img, results), goal=goal or "推进当前任务")
     except LlmError as e:
         return _err(f"大模型调用失败: {e}")
     return _ok(scene=plan.get("scene"), reason=plan.get("reason"),
                done=plan.get("done"), actions=plan.get("actions", []),
-               candidates=plan.get("candidates", []), dry_run=dry_run)
+               clickable=plan.get("clickable", []), context=plan.get("context", []),
+               dry_run=dry_run)
 
 
 # ---------- 游戏功能（见 tools/） ----------
@@ -308,9 +365,15 @@ def game_status() -> dict:
     不会启动或点击任何东西。
 
     拿到结果直接用中文回答“开着/没开”，不要顺手做别的，也不要贴字段名。
+    若检测到人工接管（鼠标被人移动/点击），额外返回 paused=true 与 resume_in_sec（剩余秒数），
+    此时不要重试点击/按键类工具，静待用户停手后自动恢复。
     """
     try:
-        return _ok(**game_tools.is_game_running(cfgmod.load_config()))
+        cfg = cfgmod.load_config()
+        guard = get_guard(cfg.get("human_guard", {}))
+        paused = guard.paused
+        return _ok(**game_tools.is_game_running(cfg), paused=paused,
+                   resume_in_sec=round(guard.resume_in(), 1) if paused else 0.0)
     except Exception as e:  # noqa: BLE001
         return _err(f"检测失败: {e}")
 
@@ -416,11 +479,30 @@ def _run_streamable_http() -> None:
                 allowed_hosts=HTTP_ALLOWED_HOSTS))
 
 
+def _start_guard() -> None:
+    """启动人工接管保护，并注册全局急停热键（幂等，失败不阻服务启动）。
+
+    `start_stop_listener` 以前全仓库零调用，导致 F12 急停实际从未生效；
+    而 `wait_if_paused` 需要一个“暂停中彻底停”的出口，所以在这里兜底注册。
+    """
+    try:
+        cfg = cfgmod.load_config()
+    except Exception as e:  # noqa: BLE001 配置缺失不能阻住服务
+        log.warning("读取配置失败，人工接管保护与急停热键使用默认值: %s", e)
+        cfg = {}
+    get_guard(cfg.get("human_guard", {})).start()
+    try:
+        user_input.start_stop_listener(cfg.get("input", {}).get("stop_hotkey", "f12"))
+    except Exception as e:  # noqa: BLE001
+        log.warning("急停热键注册失败，F12 不可用: %s", e)
+
+
 def main() -> None:
     log.info("MCP server 启动 transport=%s pid=%d python=%s 项目根=%s 日志=%s",
              TRANSPORT, os.getpid(), platform.python_version(),
              runlog.PROJECT_ROOT, runlog.log_path())
     _install_quit_handler()
+    _start_guard()
     try:
         if TRANSPORT == "stdio":
             app.run(transport="stdio")

@@ -31,9 +31,14 @@ class TemplateMatch:
 
 class TemplateMatcher:
     def __init__(self, templates_dir: str = "assets/templates",
-                 default_threshold: float = 0.85):
+                 default_threshold: float = 0.85,
+                 items: Optional[dict] = None, multi_scale: bool = False):
         self.templates_dir = templates_dir
         self.default_threshold = default_threshold
+        # config.template.items：模板清单。新增模板只需裁图丢进 assets/templates/
+        # 并加一行配置，不必改代码。
+        self.items: dict = dict(items or {})
+        self.multi_scale = bool(multi_scale)
         os.makedirs(templates_dir, exist_ok=True)
 
     @lru_cache(maxsize=64)
@@ -113,6 +118,28 @@ class TemplateMatcher:
             if best:
                 break  # 某尺度命中后不再尝试其他尺度
         return best
+
+    def scan(self, img: np.ndarray, items: Optional[dict] = None,
+             multi_scale: Optional[bool] = None
+             ) -> List[Tuple[str, dict, TemplateMatch]]:
+        """按 config.template.items 逐项匹配，返回 (name, item_cfg, match)。
+
+        文件缺失静默跳过（模板未标定属正常情况，不应报警也不应中断流程）。
+        是否可点不在模板项里声明：统一由 config.vision.clickable_kinds 按
+        item_cfg["kind"] 决定，避免两处开关互相矛盾。
+        """
+        cfg_items = self.items if items is None else items
+        ms = self.multi_scale if multi_scale is None else bool(multi_scale)
+        matches: List[Tuple[str, dict, TemplateMatch]] = []
+        for name, item in (cfg_items or {}).items():
+            if not isinstance(item, dict):
+                continue
+            tpl = item.get("file") or f"{name}.png"
+            match = self.find(img, tpl, threshold=item.get("threshold"),
+                              multi_scale=ms)
+            if match is not None:
+                matches.append((name, item, match))
+        return matches
 
     def wait_for(self, img_provider, template: str, timeout: float = 10.0,
                  interval: float = 0.5, **kw) -> Optional[TemplateMatch]:

@@ -9,10 +9,12 @@ from typing import List, Optional
 import numpy as np
 
 from ..core import capture as cap
+from ..core.human_guard import get_guard
 from ..core.input import InputController, is_stopped
 from ..core.window import WindowInfo
 from ..vision.ocr import OcrResult, find_text, ocr_image, match_text
 from ..vision.llm import Advisor
+from ..vision.screen import Region, analyze_regions
 from ..vision.template import TemplateMatch, TemplateMatcher
 from ..vision.yolo import YoloDetector
 from .log import get_logger
@@ -31,9 +33,12 @@ class BotContext:
         self.cfg = cfg
         self.win = win
         self.input = InputController(win, cfg.get("input", {}))
+        tpl_cfg = cfg.get("template", {}) or {}
         self.templates = TemplateMatcher(
-            cfg.get("template", {}).get("templates_dir", "assets/templates"),
-            cfg.get("template", {}).get("default_threshold", 0.85),
+            tpl_cfg.get("templates_dir", "assets/templates"),
+            tpl_cfg.get("default_threshold", 0.85),
+            items=tpl_cfg.get("items", {}),
+            multi_scale=bool(tpl_cfg.get("multi_scale", False)),
         )
         self.yolo = YoloDetector(cfg.get("yolo", {}))
         self.ocr_min_conf = cfg.get("ocr", {}).get("min_confidence", 0.5)
@@ -41,6 +46,18 @@ class BotContext:
         self.save_debug = cfg.get("capture", {}).get("save_debug", True)
         # 大模型决策助手（未配置 key 时相关调用会安全降级为 None/异常）
         self.advisor = Advisor(cfg)
+        # 人工接管保护：鼠标被人移动/点击即暂停全部输入（start 幂等，无权限时自动降级）
+        self.human_guard = get_guard(cfg.get("human_guard", {}))
+        self.human_guard.start()
+
+    # ---------- 人工接管保护 ----------
+    def guard(self, max_block_sec: float = 0.0) -> bool:
+        """暂停中则等待恢复。返回 False 表示应中止当前流程（急停或等待超时）。"""
+        return self.human_guard.wait_if_paused(max_block_sec)
+
+    def guard_generation(self) -> int:
+        """暂停代次：与计算前不一致说明中途被人工接管，算出的坐标已作废。"""
+        return self.human_guard.generation
 
     # ---------- 感知 ----------
     def grab(self) -> np.ndarray:
@@ -70,6 +87,15 @@ class BotContext:
         img = self.grab()
         return img, self.ocr(img)
 
+    def analyze(self, img: Optional[np.ndarray] = None,
+                results: Optional[List[OcrResult]] = None) -> List[Region]:
+        """三层视觉融合（模板 → YOLO → OCR），返回排好序的 Region 列表。
+
+        复用传入的截图与全图 OCR 结果，保证一帧只做一次全图识别；
+        不传则自行补齐，调用方无需关心内部顺序。
+        """
+        return analyze_regions(self, img, results)
+
     @staticmethod
     def find_in(results, keyword: str, exact: bool = False) -> Optional[OcrResult]:
         """在 snapshot 的 results 里匹配关键字（不再 OCR）。"""
@@ -88,6 +114,8 @@ class BotContext:
         """轮询截图直到关键字出现。"""
         end = time.time() + timeout
         while time.time() < end and not is_stopped():
+            if not self.guard():
+                return None
             hit = self.find_text(keyword)
             if hit:
                 return hit
@@ -104,6 +132,8 @@ class BotContext:
         """等待某文字从画面消失（如加载提示、进度文案）。"""
         end = time.time() + timeout
         while time.time() < end and not is_stopped():
+            if not self.guard():
+                return False
             if self.find_text(keyword) is None:
                 return True
             time.sleep(interval)

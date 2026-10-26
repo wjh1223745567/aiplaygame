@@ -1,7 +1,7 @@
 """游戏功能 · 启动、登录、回主界面与关闭。
 
 open_game / login / back_to_main / close_game 均返回 JSON 友好的 dict（供 MCP server 直接透出）。
-定位一律走 OCR 文字，不依赖模板图。
+定位以 OCR 文字为主；模板标定后（assets/templates）额外提供精确坐标，未标定则行为与改造前一致。
 """
 from __future__ import annotations
 
@@ -108,6 +108,26 @@ def is_game_running(cfg: dict) -> dict:
 
 def _ocr(cfg: dict, img):
     return ocr_image(img, min_confidence=cfg.get("ocr", {}).get("min_confidence", 0.5))
+
+
+# ---------- 区域辅助（三层融合输出 Region 列表，见 vision/screen.py） ----------
+def _region_texts(regions) -> list[str]:
+    """全部区域文字：既是画面指纹也是既有文案判定的输入。"""
+    return [r.text for r in regions if r.text]
+
+
+def _button_texts(regions) -> list[str]:
+    """只取可点按钮类区域的文字（未标定模板/YOLO 时为空→调用方回退到全部文字）。"""
+    return [r.text for r in regions if r.kind == "button" and r.text]
+
+
+def _template_point(regions, *names: str):
+    """模板命中的精确点击点；未标定模板时返回 None（静默降级）。"""
+    for name in names:
+        for r in regions:
+            if (r.meta or {}).get("template") == name:
+                return r.points[0] if r.points else r.center
+    return None
 
 
 def open_game(cfg: dict, wait_timeout: float = 90.0) -> dict:
@@ -313,8 +333,14 @@ def back_to_main(cfg: dict, max_steps: int = BACK_MAX_STEPS) -> dict:
     esc = 0
     tried_points: list[tuple[int, int]] = []
     for step in range(1, max_steps + 1):
+        # 人工接管中则暂停：等不到恢复（急停/超时）就整轮放弃，避免无人看管时乱点
+        if not ctx.guard():
+            return {"ok": False, "stage": "paused", "closed": closed, "esc_presses": esc,
+                    "error": "等待人工操作结束时被中断，已停止返回主界面流程"}
         img = ctx.grab()
         results = _ocr(cfg, img)
+        # 模板层只用来给「关闭键」精确坐标，文字判定仍走 OCR 原文，避免改变既有行为
+        regions = ctx.analyze(img, results)
         texts = [r.text for r in results]
         button = _close_button(texts, closed)
         hit = BotContext.find_in(results, button) if button else None
@@ -322,6 +348,15 @@ def back_to_main(cfg: dict, max_steps: int = BACK_MAX_STEPS) -> dict:
             _log.info("back_to_main: 关闭「%s」(%d,%d)（第 %d 步）", button, hit.cx, hit.cy, step)
             ctx.input.click(hit.cx, hit.cy)
             closed.append(button)
+            time.sleep(BACK_STEP_WAIT)
+            continue
+        # 未标定模板时这一步为空，行为与改造前一致；标定后一步命中最准的关闭键
+        tpl_point = _template_point(regions, "close_x")
+        if tpl_point is not None and tuple(tpl_point) not in tried_points:
+            _log.info("back_to_main: 模板命中关闭键 close_x (%d,%d)（第 %d 步）",
+                      tpl_point[0], tpl_point[1], step)
+            ctx.input.click(tpl_point[0], tpl_point[1])
+            tried_points.append(tuple(tpl_point))
             time.sleep(BACK_STEP_WAIT)
             continue
         if _main_scene_hit(texts):
@@ -413,10 +448,15 @@ def _wait_ready(ctx: BotContext, cfg: dict, timeout: float,
     end = time.time() + timeout
     stuck = 0
     while time.time() < end:
-        results = _ocr(cfg, ctx.grab())
+        if not ctx.guard():
+            return None
+        img = ctx.grab()
+        results = _ocr(cfg, img)
+        # 一帧只做一次全图 OCR：三层融合复用同一份截图与识别结果
+        regions = ctx.analyze(img, results)
         texts = [r.text for r in results]
-        if _has_dialog(texts):
-            if _confirm_dialog(ctx, results, texts, dialogs):
+        if _has_dialog(texts, regions):
+            if _confirm_dialog(ctx, regions, results, texts, dialogs):
                 stuck = 0
             else:
                 stuck += 1
@@ -425,7 +465,9 @@ def _wait_ready(ctx: BotContext, cfg: dict, timeout: float,
                     return None
             time.sleep(0.8)
             continue
-        hits = [b for b in LOGIN_BUTTONS if any(b in t for t in texts)]
+        # 登录按钮优先取可点按钮类区域；模板/YOLO 未就绪时为空，回退到全部文字
+        button_texts = _button_texts(regions) or texts
+        hits = [b for b in LOGIN_BUTTONS if any(b in t for t in button_texts)]
         loading = any(any(h in t for h in LOADING_HINTS) for t in texts)
         if hits and not loading:
             return hits[0]
@@ -433,24 +475,48 @@ def _wait_ready(ctx: BotContext, cfg: dict, timeout: float,
     return None
 
 
-def _has_dialog(texts: list[str]) -> bool:
-    """画面里是否有挡路的提示弹窗：确认按钮或已知正文任一命中。"""
+def _has_dialog(texts: list[str], regions=None) -> bool:
+    """画面里是否有挡路的提示弹窗：弹窗区域、确认按钮或已知正文任一命中。
+
+    regions 传三层融合结果时，kind=dialog 的区域（模板 dialog_bg / YOLO dialog）
+    直接算命中；不传则退化为纯文字判定，与改造前一致。
+    """
+    if regions is not None and any(r.kind == "dialog" and r.text for r in regions):
+        return True
     if any(any(b in t for t in texts) for b in DIALOG_CONFIRM_BUTTONS):
         return True
     return any(any(h in t for t in texts) for h in DIALOG_HINTS)
 
 
-def _confirm_dialog(ctx: BotContext, results, texts: list[str],
+def _confirm_dialog(ctx: BotContext, regions, results, texts: list[str],
                     dialogs: list[str] | None = None) -> bool:
     """画面上有提示弹窗就点掉，返回是否点过。
 
-    只在登录流程里调用：此时出现「确定/确认/我知道了」基本就是公告或设备风险提示。
-    已进主场景（HUD 命中）时不动手，避免误点游戏内的确认框。
+    点击顺序：模板命中的 close_x / confirm（坐标最准）→ 文字匹配的确定类按钮 →
+    正文下方偏移兜底。只在登录流程里调用：此时出现「确定/确认/我知道了」基本就是
+    公告或设备风险提示。已进主场景（HUD 命中）时不动手，避免误点游戏内的确认框。
     某个按钮点到上限后换下一个候选（而不是整体放弃）；连按钮文案都认不出时，
     按正文位置向下偏移兜底点一次，应对 OCR 把「确认」识别成别的字。
     """
     if any(any(h in t for h in MAIN_SCENE_HINTS) for t in texts):
         return False
+
+    # 1) 模板命中：close_x / confirm 直接给出精确中心，比 OCR 文字框稳
+    for name in ("close_x", "confirm"):
+        point = _template_point(regions, name)
+        if point is None:
+            continue
+        if dialogs is not None and dialogs.count(name) >= DIALOG_MAX_CLICKS:
+            continue
+        _log.info("login: 模板命中弹窗按钮 %s (%d,%d)%s", name, point[0], point[1],
+                  f"（第 {dialogs.count(name) + 1} 次）" if dialogs is not None else "")
+        ctx.input.click(point[0], point[1])
+        if dialogs is not None:
+            dialogs.append(name)
+        time.sleep(0.6)
+        return True
+
+    # 2) 文字匹配：确定 / 确认 / 我知道了
     for button in DIALOG_CONFIRM_BUTTONS:
         if not any(button in t for t in texts):
             continue
@@ -499,8 +565,8 @@ def _main_scene_hit(texts: list[str]) -> bool:
 
 
 def _in_main_scene(ctx: BotContext, cfg: dict) -> bool:
-    """单次截图 OCR 判断是否已在主场景。"""
-    return _main_scene_hit([r.text for r in _ocr(cfg, ctx.grab())])
+    """单次截图三层融合判断是否已在主场景（文字取全部区域）。"""
+    return _main_scene_hit(_region_texts(ctx.analyze()))
 
 
 def _advance_to_main_scene(ctx: BotContext, cfg: dict, timeout: float,
@@ -515,16 +581,21 @@ def _advance_to_main_scene(ctx: BotContext, cfg: dict, timeout: float,
     clicks = {} if clicks is None else clicks
     end = time.time() + timeout
     while time.time() < end:
-        results = _ocr(cfg, ctx.grab())
-        texts = [r.text for r in results]
+        if not ctx.guard():
+            return False
+        img = ctx.grab()
+        results = _ocr(cfg, img)
+        # 与 _wait_ready 一致：一帧只 OCR 一次，融合结果同时供弹窗/按钮/文案判定
+        regions = ctx.analyze(img, results)
+        texts = _region_texts(regions)
         if _main_scene_hit(texts):
             return True
-        if _has_dialog(texts):
-            _confirm_dialog(ctx, results, texts, dialogs)
+        if _has_dialog(texts, regions):
+            _confirm_dialog(ctx, regions, results, texts, dialogs)
             time.sleep(0.8)
             continue
         loading = any(any(h in t for h in LOADING_HINTS) for t in texts)
-        button = None if loading else _enter_button(texts, clicks)
+        button = None if loading else _enter_button(_button_texts(regions) or texts, clicks)
         hit = BotContext.find_in(results, button) if button else None
         if hit is not None:
             _log.info("login: 点「%s」推进主场景 (%d,%d)（第 %d 次）",

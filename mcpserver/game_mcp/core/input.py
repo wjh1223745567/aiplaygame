@@ -13,6 +13,7 @@ from pynput import keyboard as kb
 from pynput.mouse import Button as MouseButton
 from pynput.mouse import Controller as MouseController
 
+from .human_guard import get_guard
 from .log import get_logger
 from .window import WindowInfo, ensure_front
 
@@ -20,6 +21,8 @@ _log = get_logger("core.input")
 
 _STOP_FLAG = {"stopped": False}
 _DRY_RUN = {"enabled": False}
+# 急停 hotkey listener 必须存模块全局：局部变量被 GC 回收后热键会随之失效
+_STOP_LISTENER = None
 
 
 def set_dry_run(enabled: bool) -> None:
@@ -104,11 +107,20 @@ class InputController:
         return self._ensure_front()
 
     # ---------- 鼠标 ----------
+    # 每个写操作的两步顺序不能换：先 wait_if_paused() 再 program_action()。
+    # 若先进入 program_action()，暂停等待期间计数不为 0，监听器会把人工事件
+    # 当程序动作丢掉，人工接管永远无法结束。
     def move_to(self, px: float, py: float) -> None:
+        if not get_guard().wait_if_paused():
+            return
+        with get_guard().program_action():
+            self._move_to_raw(px, py)
+
+    def _move_to_raw(self, px: float, py: float) -> None:
+        """真正的插值移动；调用方必须已处于 program_action() 内。"""
         gx, gy = self.to_global(px, py)
         cur = self._mouse.position
         steps = 12
-        start = time.time()
         for i in range(1, steps + 1):
             if is_stopped():
                 return
@@ -128,13 +140,17 @@ class InputController:
         if is_dry_run():
             _log.info("dry-run 点击 (%d,%d) %s", px, py, button)
             return
+        if not get_guard().wait_if_paused():
+            return
+        # 前台切换不产生鼠标事件，放在 program_action 之外，免得白白扩大宽限期
         self._ensure_front()
         jx = px + random.uniform(-self.offset, self.offset)
         jy = py + random.uniform(-self.offset, self.offset)
-        if move_first:
-            self.move_to(jx, jy)
-        btn = MouseButton.left if button == "left" else MouseButton.right
-        self._mouse.click(btn, count=2 if double else 1)
+        with get_guard().program_action():
+            if move_first:
+                self._move_to_raw(jx, jy)
+            btn = MouseButton.left if button == "left" else MouseButton.right
+            self._mouse.click(btn, count=2 if double else 1)
         _log.info("点击 (%d,%d) %s%s", px, py, button, " 双击" if double else "")
 
     def drag(self, p1: tuple, p2: tuple) -> None:
@@ -143,23 +159,30 @@ class InputController:
         if is_dry_run():
             _log.info("dry-run 拖拽 (%d,%d) -> (%d,%d)", *p1, *p2)
             return
-        self.move_to(*p1)
-        self._mouse.press(MouseButton.left)
-        # 分两段移动，避免长距离瞬移
-        mid = ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
-        self.move_to(*mid)
-        self.move_to(*p2)
-        time.sleep(random.uniform(0.05, 0.15))
-        self._mouse.release(MouseButton.left)
+        if not get_guard().wait_if_paused():
+            return
+        with get_guard().program_action():
+            self._move_to_raw(*p1)
+            self._mouse.press(MouseButton.left)
+            # 分两段移动，避免长距离瞬移
+            mid = ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
+            self._move_to_raw(*mid)
+            self._move_to_raw(*p2)
+            time.sleep(random.uniform(0.05, 0.15))
+            self._mouse.release(MouseButton.left)
         _log.info("拖拽 (%d,%d) -> (%d,%d)", *p1, *p2)
 
     # ---------- 键盘 ----------
+    # 键盘事件不产生鼠标回调，所以只查暂停，不包 program_action：
+    # 否则打字/按键期间用户接管鼠标会被一并屏蔽掉。
     def press_key(self, key: str) -> bool:
         if is_stopped():
             return False
         if is_dry_run():
             _log.info("dry-run 按键 %s", key)
             return True
+        if not get_guard().wait_if_paused():
+            return False
         # 键盘事件是全局的：窗口不在前台时不发，否则会打到用户当前正在用的应用上
         if not self._ensure_front():
             _log.warning("按键 %s 未发送：游戏窗口不在前台，避免落到其他应用", key)
@@ -175,13 +198,16 @@ class InputController:
         return True
 
     def press_enter(self) -> None:
-        self._tap(kb.Key.enter)
+        if get_guard().wait_if_paused():
+            self._tap(kb.Key.enter)
 
     def press_esc(self) -> None:
-        self._tap(kb.Key.esc)
+        if get_guard().wait_if_paused():
+            self._tap(kb.Key.esc)
 
     def press_tab(self) -> None:
-        self._tap(kb.Key.tab)
+        if get_guard().wait_if_paused():
+            self._tap(kb.Key.tab)
 
     def hotkey(self, *keys: str) -> None:
         """组合键，如 hotkey('cmd', 'v')。"""
@@ -189,6 +215,8 @@ class InputController:
             return
         if is_dry_run():
             _log.info("dry-run 组合键 %s", "+".join(keys))
+            return
+        if not get_guard().wait_if_paused():
             return
         self._ensure_front()
         mapped = []
@@ -218,8 +246,12 @@ class InputController:
         if is_dry_run():
             _log.info("dry-run 输入 %r", text)
             return
+        if not get_guard().wait_if_paused():
+            return
         controller = self._keyboard()
         for ch in text:
+            if is_stopped():
+                return
             if ch == "\n":
                 controller.press(kb.Key.enter)
                 controller.release(kb.Key.enter)
@@ -254,17 +286,27 @@ def stop() -> None:
 
 
 def start_stop_listener(hotkey: str = "f12") -> Optional[kb.GlobalHotKeys]:
-    """注册全局急停热键（默认 F12）。"""
+    """注册全局急停热键（默认 F12）。幂等：重复调用返回同一个 listener。
+
+    listener 存到模块全局（_STOP_LISTENER）：局部变量被 GC 回收后热键会随之失效。
+    """
+    global _STOP_LISTENER
+    if _STOP_LISTENER is not None:
+        return _STOP_LISTENER
     key = _HOTKEYS.get(hotkey.lower())
     if key is None:
+        _log.warning("急停热键 %r 不支持，未注册", hotkey)
         return None
     try:
         listener = kb.GlobalHotKeys({str(key): _on_stop})
         listener.daemon = True
         listener.start()
-        return listener
-    except Exception:
+    except Exception as e:  # noqa: BLE001 注册失败不能拖垮 server
+        _log.warning("急停热键注册失败（%s），%s 急停不可用", e, hotkey.upper())
         return None
+    _STOP_LISTENER = listener
+    _log.info("全局急停热键已注册 %s", hotkey.upper())
+    return listener
 
 
 def _on_stop() -> None:
