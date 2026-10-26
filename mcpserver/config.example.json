@@ -57,5 +57,15 @@
     "imgsz": 1280,
     "ui_classes": ["button", "task", "info", "dialog", "icon"],
     "class_map": {}
+  },
+  "general": {
+    "enabled": true,
+    "model_path": "assets/models/yolo11s.pt",
+    "conf_threshold": 0.35,
+    "device": "cpu",
+    "imgsz": 1280,
+    "classes": ["person"],
+    "default_kind": "entity",
+    "class_map": {}
   }
 }

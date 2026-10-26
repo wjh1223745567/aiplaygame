@@ -116,6 +116,7 @@ class Detection:
     confidence: float
     box: Tuple[int, int, int, int]           # x1, y1, x2, y2
     kind: str = ""                          # 归一化后的内部类型（button/icon/info…）
+    layer: str = "ui"                       # ui=UITag 控件层 / general=通用检测层
 
     @property
     def cx(self) -> float:
@@ -142,6 +143,13 @@ class YoloDetector:
         self.ui_classes = list(cfg.get("ui_classes") or UI_CLASSES)
         # 模型类别名 -> 内部 kind 的补充映射（覆盖 CLASS_MAP），换模型时只改配置
         self.class_map = dict(cfg.get("class_map") or {})
+        # 未收录类别名的降级 kind：UITag 层用 info（只读锚点），通用层用 entity（游戏实体）
+        self.default_kind = str(cfg.get("default_kind") or "info")
+        # 显式配了 default_kind 就说明「未收录的都归这里」，不必再逐个类别告警
+        # （通用层跑 COCO 时 80 类全未收录，逐个提示只是噪声）
+        self._quiet_unknown = "default_kind" in cfg
+        # 本检测器属于哪一层，写进 Detection 供上层区分（通用检测器构造时传 general）
+        self.layer = str(cfg.get("layer") or "ui")
         # 只在调试时允许回退 COCO：默认关闭，否则 person/car 会被当成 UI 元素
         self.allow_pretrained_fallback = bool(cfg.get("allow_pretrained_fallback", False))
         self._model = None
@@ -167,10 +175,10 @@ class YoloDetector:
             names = [str(v) for v in (getattr(self._model, "names", {}) or {}).values()]
             _log.info("YOLO 模型已加载 %s（%d 类: %s）", path, len(names), names)
             unmapped = [n for n in names if _lookup(n, self.class_map) is None]
-            if unmapped:
-                _log.warning("YOLO 有 %d 个类别名未收录映射 %s，将按 info 处理；"
-                             "需要可点就在 yolo.class_map 里指定（如 {\"Checkbox\": \"button\"}）",
-                             len(unmapped), unmapped)
+            if unmapped and not self._quiet_unknown:
+                _log.warning("YOLO 有 %d 个类别名未收录映射 %s，将按 %s 处理；"
+                             "需要改判定就在 class_map 里指定（如 {\"Checkbox\": \"button\"}）",
+                             len(unmapped), unmapped, self.default_kind)
         except Exception as e:  # 依赖未装或权重损坏
             self.enabled = False
             self._load_error = str(e)
@@ -204,16 +212,16 @@ class YoloDetector:
                 label = str(names.get(int(b.cls[0]), int(b.cls[0])))
                 kind = _lookup(label, self.class_map)
                 if kind is None:
-                    kind = "info"                       # 未知类别只作只读锚点，绝不点
-                    if label not in self._unknown:      # 只提示一次，避免逐帧刷屏
-                        self._unknown.add(label)
-                        _log.warning("YOLO 类别 %r 未收录映射，按 info（只读锚点）处理；"
-                                     "可在 yolo.class_map 里指定它的 kind", label)
+                    kind = self.default_kind           # 未知类别只当锚点，绝不假设可点
+                    if not self._quiet_unknown and label not in self._unknown:
+                        self._unknown.add(label)        # 只提示一次，避免逐帧刷屏
+                        _log.warning("YOLO 类别 %r 未收录映射，按 %s 处理；"
+                                     "可在 class_map 里指定它的 kind", label, kind)
                 # classes 同时匹配模型类别名与内部 kind，两种写法都能筛
                 if wanted and label.strip().lower() not in wanted and kind not in wanted:
                     continue
                 detections.append(Detection(label, float(b.conf[0]),
-                                            (x1, y1, x2, y2), kind))
+                                            (x1, y1, x2, y2), kind, self.layer))
         return detections
 
     def find(self, img: np.ndarray, label: str) -> Optional[Detection]:

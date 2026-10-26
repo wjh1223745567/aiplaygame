@@ -19,6 +19,7 @@ import os
 import platform
 import signal
 import time
+import types
 from typing import List, Optional
 
 from mcp.server.mcpserver import MCPServer
@@ -31,6 +32,7 @@ from .core.engine import BotContext
 from .core.human_guard import get_guard
 from .core.window import find_game_window, list_windows as _list_windows
 from .vision.yolo import YoloDetector
+from .vision.screen import detect_layers
 from .tools import game as game_tools
 from .tools import daily as daily_tools
 
@@ -208,8 +210,9 @@ def layout() -> dict:
     """需要查看当前画面被分成哪些区域（按钮/任务/信息/弹窗）时用：返回 count 与
     regions[{kind,source,text,box,cx,cy,confidence}]。
 
-    kind 取 button/icon/task/dialog/info/label，source 取 template/yolo/ocr；
-    只有 kind=button 的区域会被当作可点击项，其余只是供判断的只读信息。
+    kind 取 button/icon/task/dialog/entity/info/label，source 取 template/yolo/general/ocr；
+    只有 kind 在 vision.clickable_kinds（现为 button）里的区域会被当作可点击项，
+    其余（含 entity 游戏实体）只是供判断的只读信息。
     只读无副作用；模板与 YOLO 都未就绪时等价于 OCR 按行聚合的文本（source=ocr）。
     """
     try:
@@ -223,16 +226,16 @@ def layout() -> dict:
 
 
 @tool
-def detect(classes: Optional[List[str]] = None) -> dict:
-    """OCR 读不出图标类按钮、需要按图案找 UI 区域时用：返回 count、model_classes
-    （权重支持的全部类别名）与 detections[{label,kind,confidence,box,cx,cy}]。
+def detect(classes: Optional[List[str]] = None, layer: str = "all") -> dict:
+    """需要按图案找 UI 控件或游戏实体时用：返回 count、model_classes 与
+    detections[{label,kind,layer,confidence,box,cx,cy}]。
 
-    classes 非空时只保留匹配的检测：既可写模型原始类别名（Button / Icon），也可写内部
-    kind（button / icon / info / dialog / task / label），不区分大小写；为空则用配置的
-    ui_classes。kind 是归一化后的内部类型，决定该区域是否可点（由 vision.clickable_kinds
-    决定，现阶段仅 button），未收录的类别名一律按 info 处理。
-    本层只做区域分类，不区分按钮语义（保存还是取消由区内 OCR 文字给出）。
-    权重缺失（assets/models/uitag-yolo11s-ui-detect-v1.pt）时返回 ok=false。只读无副作用。
+    layer 取 all（默认：先用 UITag 分类控件，再用通用模型找实体，去重合并、UI 优先）、
+    ui（仅 UITag）、general（仅通用模型）。
+    classes 非空时只保留匹配的检测：可写模型类别名（Button / person）也可写内部 kind
+    （button / icon / entity…），不区分大小写；为空时 ui 层用 ui_classes、general 层用
+    general.classes。kind 决定该区域是否可点（见 vision.clickable_kinds，现阶段仅 button），
+    layer=general 的结果一律是只读锚点。权重缺失时返回 ok=false。只读无副作用。
     """
     try:
         cfg = cfgmod.load_config()
@@ -240,17 +243,32 @@ def detect(classes: Optional[List[str]] = None) -> dict:
         if win is None:
             return _err("未找到游戏窗口")
         img = cap.capture_window(win)
-        ycfg = dict(cfg.get("yolo", {}))
-        ycfg["enabled"] = True
-        det = YoloDetector(ycfg)
-        dets = det.detect_ui(img, classes=classes)
-        if det._load_error:
-            return _err(f"YOLO 加载失败: {det._load_error}")
-        return _ok(count=len(dets), model_classes=det.class_names, detections=[
-            {"label": d.label, "kind": d.kind, "confidence": round(d.confidence, 3),
-             "box": list(d.box), "cx": round(d.cx), "cy": round(d.cy)}
-            for d in dets
-        ])
+        layer = (layer or "all").strip().lower()
+        if layer not in ("all", "ui", "general"):
+            return _err("layer 只能是 all / ui / general")
+        ui = YoloDetector({**dict(cfg.get("yolo", {})), "enabled": layer != "general"})
+        gen = YoloDetector({**dict(cfg.get("general", {})), "layer": "general",
+                            "enabled": layer != "ui"})
+        if layer == "all":
+            dets = detect_layers(types.SimpleNamespace(cfg=cfg, yolo=ui, general=gen), img)
+        elif layer == "ui":
+            dets = ui.detect_ui(img, classes=classes)
+        else:
+            g_classes = classes or list((cfg.get("general", {}) or {}).get("classes") or [])
+            dets = gen.detect(img, classes=g_classes or None)
+        errs = [f"{name}: {d._load_error}" for name, d in (("ui", ui), ("general", gen))
+                if d._load_error]
+        if not dets and errs:
+            return _err("YOLO 加载失败 " + "；".join(errs))
+        return _ok(count=len(dets),
+                   model_classes={"ui": ui.class_names, "general": gen.class_names},
+                   detections=[
+                       {"label": d.label, "kind": d.kind, "layer": d.layer,
+                        "confidence": round(d.confidence, 3),
+                        "box": list(d.box), "cx": round(d.cx), "cy": round(d.cy)}
+                       for d in dets
+                   ],
+                   **({"warnings": errs} if errs else {}))
     except Exception as e:  # noqa: BLE001
         return _err(f"检测异常: {e}")
 

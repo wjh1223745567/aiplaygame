@@ -92,15 +92,19 @@ def _img_to_data_url(img: np.ndarray, max_side: int = 1024) -> str:
 
 # 区域类型的中文名：只读上下文按「类型: 内容」渲染给模型
 _KIND_CN = {"button": "按钮", "icon": "图标", "task": "任务",
-            "dialog": "弹窗", "info": "信息", "label": "文本"}
+            "dialog": "弹窗", "info": "信息", "label": "文本", "entity": "实体"}
 
 
 def _region_text(region) -> str:
-    """区域的可读文字：优先区内 OCR，模板区域没有文字就用模板名兜底。"""
+    """区域的可读文字：优先区内 OCR，实体用检测类别，模板区域用模板名兜底。"""
     text = (region.text or "").strip()
     if text:
         return text
-    name = (region.meta or {}).get("template")
+    meta = region.meta or {}
+    if region.kind == "entity":
+        # 通用层只有类别（person/NPC…），没有文字：告诉模型「这里有个什么东西」
+        return str(meta.get("general_label") or "目标")
+    name = meta.get("template")
     return str(name) if name else _KIND_CN.get(region.kind, region.kind)
 
 
@@ -146,8 +150,9 @@ def build_candidates(regions, clickable_kinds=("button",), fallback: bool = True
     context: List[str] = []
     for r in readonly:
         # YOLO 区域常常只有类别、区内没文字（图标/工具栏/面板）：这种行没有信息量，
-        # 只会把 prompt 塞满「信息: 信息」，直接不写。模板区域保留名字方便排查。
-        if not (r.text or "").strip() and not (r.meta or {}).get("template"):
+        # 只会把 prompt 塞满「信息: 信息」，直接不写。实体与模板区域保留。
+        if r.kind != "entity" and not (r.text or "").strip() \
+                and not (r.meta or {}).get("template"):
             continue
         text = _region_text(r)
         if text:

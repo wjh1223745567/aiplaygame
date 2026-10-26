@@ -41,6 +41,8 @@ class BotContext:
             multi_scale=bool(tpl_cfg.get("multi_scale", False)),
         )
         self.yolo = YoloDetector(cfg.get("yolo", {}))
+        # 第二级：通用检测（COCO 等）用来找游戏实体，与 UITag 结果去重后只作只读锚点
+        self.general = YoloDetector({**(cfg.get("general", {}) or {}), "layer": "general"})
         self.ocr_min_conf = cfg.get("ocr", {}).get("min_confidence", 0.5)
         self.debug_dir = cfg.get("capture", {}).get("debug_dir", "debug")
         self.save_debug = cfg.get("capture", {}).get("save_debug", True)

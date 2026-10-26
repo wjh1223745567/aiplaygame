@@ -37,7 +37,7 @@ autogame/
 │   │   ├── server.py              # MCPServer("wendao-game") + 17 个 @tool（统一埋点）
 │   │   ├── config.py              # 读 mcpserver/config.json，并合并 host/config.json 的 llm
 │   │   ├── core/                  # 窗口 / 截图 / 输入 / 引擎 / 运行日志(log) / 判断日志(decision_log)
-│   │   ├── vision/                # 三层融合(screen) / OCR / 模板匹配 / YOLO / LLM 决策
+│   │   ├── vision/                # 多层融合(screen) / OCR / 模板匹配 / YOLO / LLM 决策
 │   │   └── tools/                 # game.py(open_game/login/close_game) daily.py(师门任务/扫货)
 │   ├── requirements.txt
 │   └── smoke_test.py              # Python 侧 stdio 冒烟
@@ -285,14 +285,19 @@ macOS 侧仍可用终端版对话框：`bash scripts/run-chat.sh`（`chat.jar`�
   `mcpserver/game_mcp/server.py` 的 docstring 里（MCP 会把它当 description 透给模型）；
   host 的 `SYSTEM_PROMPT` 只保留对话协议（JSON 格式、tool/reply 二选一、失败两次停手），
   不再重复工具细节。新增工具时只需在 Python 侧写清描述，Java 不用同步。
-- **三层视觉流水线**（`vision/screen.py`，模板优先）：
+- **多层视觉流水线**（`vision/screen.py`，模板优先）：
 
   ```
   截图 ─┬─ template 层：已知图标/固定元素 → Region(kind, source=template, 精确中心)
-        ├─ yolo 层   ：UI 区域分类 button/task/info/dialog/icon → 逐框 OCR 读区内文字
+        ├─ yolo 层   ：UITag 分类控件 button/task/info/dialog/icon → 逐框 OCR 读区内文字
+        ├─ general 层：通用检测找游戏实体（人物/NPC）→ Region(kind=entity, source=general)
         ├─ ocr 层    ：没被任何区域覆盖的文字 → 按「同行且水平相邻」聚成 label 兜底
-        └─ 融合去重（template > yolo > ocr，IoU ≥ 0.5 丢弃重叠）→ Region 列表 → 可点/只读分流
+        └─ 融合去重（template > yolo > general > ocr，IoU ≥ 0.5 丢弃重叠）→ Region 列表 → 可点/只读分流
   ```
+
+  两级检测共用一套去重规则（见 `detect_layers`）：先跑 UITag，再跑通用模型；
+  与 UITag 框 `IoU ≥ 0.5`、或中心点落在可点区域里（头像按钮之类）的实体框直接丢弃，
+  其余作为 `kind=entity` 只读锚点——**不认领框内文字**，所以血条旁的怪物名照样进 `label` 层。
 
   只有 `vision.clickable_kinds`（现阶段仅 `button`）里的区域会带编号 id 交给模型选，
   其余区域只作为「类型: 内容」的只读信息供判断——所以模型不可能把正文里出现的「确定」二字当按钮点掉。
@@ -313,6 +318,11 @@ macOS 侧仍可用终端版对话框：`bash scripts/run-chat.sh`（`chat.jar`�
   （COCO 的 person/car 当 UI 用只会坑下游），除非显式设 `yolo.allow_pretrained_fallback=true`。
   面积超过整图 35% 的框一律当容器：不参与可点、也不认领框内文字，
   避免「整屏一个窗口框」把 OCR 全吃进 `info`、使 `label` 兜底层失效导致流程空转。
+- **通用检测层**（`general` 段，默认开）：拿 `assets/models/yolo11s.pt`（COCO 80 类）
+  找游戏实体，`classes: ["person"]` 是白名单（COCO 的 tv/car 对游戏没用，不筛只会增加噪声），
+  `default_kind: "entity"` 决定未收录类别名归成 `entity`（只读锚点）。
+  它和 UITag 是两个独立 `YoloDetector`：任一层权重缺失只影响自己，不会拖垮另一层；
+  `detect` 工具用 `layer=all|ui|general` 可分别查看两层结果。
 - **人工接管即暂停**：鼠标被**人**移动或点击后，自动化立刻停手（不点击/不按键/不移动，也不推进流程），
   鼠标静止满 `human_guard.idle_resume_sec`（默认 10s）自动恢复。程序自身的移动/点击由
   `program_action()` 计数 + `program_grace_sec`（0.6s）宽限期滤掉，不会自己触发自己。
