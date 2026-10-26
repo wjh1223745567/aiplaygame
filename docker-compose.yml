@@ -5,13 +5,16 @@
 # 所以它在宿主机上以 Streamable HTTP 常驻，容器经 host.docker.internal 连过来：
 #
 #   bash scripts/run-mcpserver.sh     # 终端 A：监听 0.0.0.0:18090/mcp
-#   docker compose up -d              # 终端 B：host 容器，18080
-#
+#   bash scripts/docker-host.sh       # 终端 B：备好基础镜像 + 构建 + 启动，18080
+
 services:
   host:
     build:
-      context: .
-      dockerfile: host/Dockerfile
+      # context 必须是 ./host，不能是仓库根：daemon 要先遍历整个上下文才能应用
+      # .dockerignore，仓库根 2.7 万个文件（.venv 1.1G）单遍历就要 4 分钟，
+      # 真正的构建反而不到 1 秒。
+      context: ./host
+      dockerfile: Dockerfile
       args:
         # Docker Hub 直连常不通，改用镜像源：HOST_BASE_IMAGE=docker.1ms.run/library/eclipse-temurin:21-jre docker compose build
         BASE_IMAGE: ${HOST_BASE_IMAGE:-eclipse-temurin:21-jre}

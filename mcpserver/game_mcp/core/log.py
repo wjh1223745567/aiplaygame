@@ -102,6 +102,17 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name if name.startswith("game_mcp") else f"game_mcp.{name}")
 
 
+def verbose() -> bool:
+    """当前是否会真正输出 DEBUG。
+
+    ``logger.isEnabledFor(DEBUG)`` 在这里没用：root 恒为 DEBUG，真正的过滤在 handler
+    上（文件默认 INFO、stderr 默认 WARNING），所以得直接看 handler 级别。
+    用于「DEBUG 打全量、INFO 只打摘要」这类分级输出。
+    """
+    setup()
+    return any(h.level <= logging.DEBUG for h in logging.getLogger("game_mcp").handlers)
+
+
 def brief(value, limit: int = 400) -> str:
     """把参数/结果压成单行短文本，避免一条日志被大对象冲爆。"""
     try:

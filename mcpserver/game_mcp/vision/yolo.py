@@ -25,7 +25,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from ..core.log import get_logger
+from ..core.log import get_logger, verbose
 
 _log = get_logger("vision.yolo")
 
@@ -130,6 +130,25 @@ class Detection:
     @property
     def cy(self) -> float:
         return (self.box[1] + self.box[3]) / 2
+
+
+# INFO 下明细最多打这么多个框（行别太长）；DEBUG 下给全量，排查时才有完整数据
+_LOG_ITEMS = 12
+
+
+def _brief(dets: List["Detection"], limit: Optional[int] = None) -> str:
+    """检测结果速记：`Button/button(0.38)@1180,70 box=(1102, 42, 1258, 98)`。
+
+    limit=None 表示不截断（DEBUG 用）；超出 limit 时只补一句「另有 N 个」。
+    """
+    items = dets if limit is None else dets[:limit]
+    parts = [
+        f"{d.label}/{d.kind}({d.confidence:.2f})@{int(d.cx)},{int(d.cy)} box={d.box}"
+        for d in items
+    ]
+    if len(items) < len(dets):
+        parts.append(f"…另有 {len(dets) - len(items)} 个")
+    return " | ".join(parts)
 
 
 # 权重缓存（模块级）：ultralytics 加载 .pt 要读几十 MB 并建计算图，耗秒级。
@@ -257,6 +276,15 @@ class YoloDetector:
                     continue
                 detections.append(Detection(label, float(b.conf[0]),
                                             (x1, y1, x2, y2), kind, self.layer))
+        # 命中明细用 info：出问题时第一手要看的就是「这一帧到底框到了什么、置信度多少」。
+        # 无检出不刷 info（安静场景每帧一行「没结果」只是噪声），DEBUG 才看。
+        if detections:
+            limit = None if verbose() else _LOG_ITEMS
+            _log.info("YOLO[%s] 检出 %d 个 (conf>=%.2f imgsz=%d): %s",
+                      self.layer, len(detections), self.conf, self.imgsz,
+                      _brief(detections, limit))
+        else:
+            _log.debug("YOLO[%s] 无检出 (conf>=%.2f imgsz=%d)", self.layer, self.conf, self.imgsz)
         return detections
 
     def find(self, img: np.ndarray, label: str) -> Optional[Detection]:

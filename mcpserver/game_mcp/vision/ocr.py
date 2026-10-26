@@ -11,6 +11,10 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
+from ..core.log import get_logger, verbose
+
+_log = get_logger("vision.ocr")
+
 
 @dataclass
 class OcrResult:
@@ -32,6 +36,22 @@ class OcrResult:
 
 _engine = None
 
+# INFO 下明细最多打这么多条（行别太长）；DEBUG 下给全量，排查时才有完整数据
+_LOG_ITEMS = 12
+
+
+def _brief(results: List[OcrResult], limit: Optional[int] = None) -> str:
+    """识别结果速记：`'师门任务'(0.98)@120,340`。
+
+    limit=None 表示不截断（DEBUG 用）；超出 limit 时只补一句「另有 N 条」。
+    """
+    items = results if limit is None else results[:limit]
+    parts = [f"{r.text!r}({r.confidence:.2f})@{int(r.cx)},{int(r.cy)}"
+             for r in items]
+    if len(items) < len(results):
+        parts.append(f"…另有 {len(results) - len(items)} 条")
+    return " | ".join(parts)
+
 
 def _get_engine():
     global _engine
@@ -52,6 +72,7 @@ def ocr_image(img: np.ndarray, min_confidence: float = 0.5,
               region: Optional[Tuple[int, int, int, int]] = None,
               upscale: float = 1.0) -> List[OcrResult]:
     """对整图（或 region=(x1,y1,x2,y2) 裁剪区）做 OCR，坐标换算回原图。"""
+    full_h, full_w = img.shape[:2]          # 裁剪会改 shape，日志里要的是原图尺寸
     offset_x = offset_y = 0
     if region:
         x1, y1, x2, y2 = region
@@ -73,6 +94,16 @@ def ocr_image(img: np.ndarray, min_confidence: float = 0.5,
         if upscale != 1.0:
             box = tuple(int(v / upscale) for v in box)  # type: ignore
         results.append(OcrResult(text=text.strip(), confidence=conf, box=box))  # type: ignore
+    # 整图 OCR 每帧只跑一次、内容是排查第一手依据 -> info；
+    # 框内小区域 OCR（每个 YOLO 框一次）数量级大得多 -> 只在 DEBUG 下打。
+    log = _log.info if region is None else _log.debug
+    if results:
+        limit = None if verbose() else _LOG_ITEMS
+        log("OCR %dx%d region=%s min_conf=%.2f 命中 %d 条: %s",
+            full_w, full_h, region, min_confidence, len(results), _brief(results, limit))
+    else:
+        _log.debug("OCR %dx%d region=%s min_conf=%.2f 无文字",
+                   full_w, full_h, region, min_confidence)
     return results
 
 

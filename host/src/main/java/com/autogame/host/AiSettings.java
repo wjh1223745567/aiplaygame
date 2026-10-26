@@ -9,6 +9,9 @@ import org.springframework.stereotype.Component;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
 
 /**
  * AI 服务配置：读 <code>host/config.json</code> 的 llm 段（与 Python 侧共用同一份）。
@@ -29,6 +32,7 @@ public class AiSettings {
     private final String apiBase;
     private final String apiKey;
     private final String model;
+    private final List<String> fallbackModels;
     private final double timeoutSeconds;
     private final double temperature;
     private final int maxImageSide;
@@ -56,6 +60,7 @@ public class AiSettings {
         }
         this.apiBase = stripTrailingSlash(text(llm, "api_base", DEFAULT_BASE));
         this.model = text(llm, "model", DEFAULT_MODEL);
+        this.fallbackModels = names(llm.path("fallback_models"));
         String fromFile = text(llm, "api_key", "");
         String fromEnv = System.getenv("LLM_API_KEY");
         this.apiKey = fromEnv != null && !fromEnv.isBlank() ? fromEnv.trim() : fromFile;
@@ -88,6 +93,19 @@ public class AiSettings {
 
     public String model() {
         return model;
+    }
+
+    /**
+     * 候选模型：主模型在前，其后是 {@code fallback_models}（去重、跳过空值）。
+     *
+     * <p>免费模型必然会被限流（智谱 429 / code 1305 就是「当前访问量过大」），
+     * 单一模型一旦被限就整轮对话失败，所以按名单依次降级。
+     */
+    public List<String> models() {
+        LinkedHashSet<String> out = new LinkedHashSet<>();
+        out.add(model);
+        out.addAll(fallbackModels);
+        return new ArrayList<>(out);
     }
 
     public double timeoutSeconds() {
@@ -138,6 +156,21 @@ public class AiSettings {
     private static boolean flag(JsonNode node, String field, boolean fallback) {
         JsonNode v = node.path(field);
         return v.isBoolean() ? v.asBoolean() : fallback;
+    }
+
+    /** 读字符串数组（非数组/空值安全）：只收非空项。 */
+    private static List<String> names(JsonNode v) {
+        List<String> out = new ArrayList<>();
+        if (!v.isArray()) {
+            return out;
+        }
+        for (JsonNode n : v) {
+            String s = n.asText("").trim();
+            if (!s.isEmpty()) {
+                out.add(s);
+            }
+        }
+        return out;
     }
 
     private static String stripTrailingSlash(String url) {

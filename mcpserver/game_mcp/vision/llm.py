@@ -69,6 +69,48 @@ class LlmError(RuntimeError):
     pass
 
 
+class _RetryableLlmError(LlmError):
+    """换个模型就可能成功的失败（限流 / 超时 / 网络 / 服务端错误）。"""
+
+
+def _model_chain(primary: str, fallbacks) -> List[str]:
+    """候选模型：主模型在前，其后是 llm.fallback_models（去重、跳过空值）。
+
+    免费视觉模型会被限流（智谱 429 / code 1305「该模型当前访问量过大」），
+    单模型一旦被限，自动决策整条链路就停了，所以按名单降级。
+    """
+    out: List[str] = []
+    for name in [primary, *(fallbacks or [])]:
+        name = str(name or "").strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def _strip_reasoning(text: str) -> str:
+    """剥掉推理模型的包装。
+
+    glm-4.1v-thinking-flash 返回
+    ``<think>…</think><answer><|begin_of_box|>{…}<|end_of_box|></answer>``，
+    原样交给 _extract_json 会先碰上思考里夹的花括号。
+    """
+    s = text or ""
+    while True:
+        start = s.find("<think")
+        if start < 0:
+            break
+        end = s.find("</think", start)
+        if end < 0:
+            # 没闭合 = 输出被截断或只吐了思考：思考里也夹着花括号，拿它当决策会点错东西，
+            # 宁可当这次失败（上层会降级/报错）
+            return s[:start].strip()
+        close = s.find(">", end)
+        s = s[:start] + s[close + 1 if close >= 0 else end + 7:]
+    for tag in ("<answer>", "</answer>", "<|begin_of_box|>", "<|end_of_box|>"):
+        s = s.replace(tag, "")
+    return s.strip()
+
+
 def _timing(ctx, key: str, default: float) -> float:
     """从 config.timing 读节奏参数（缺失/非法则用默认值）。"""
     try:
@@ -207,6 +249,9 @@ class Advisor:
         self.enabled: bool = bool(llm.get("enabled", True))
         self.base: str = (llm.get("api_base") or DEFAULT_BASE).rstrip("/")
         self.model: str = llm.get("model") or DEFAULT_MODEL
+        # 免费模型会被限流，按 model + fallback_models 依次降级；model_used 记实际用上的那个
+        self.models: List[str] = _model_chain(self.model, llm.get("fallback_models"))
+        self.model_used: str = self.model
         self.api_key: str = llm.get("api_key") or os.environ.get("LLM_API_KEY", "")
         self.timeout: float = float(llm.get("timeout", 30))
         self.max_side: int = int(llm.get("max_image_side", 1024))
@@ -236,8 +281,20 @@ class Advisor:
                 "type": "image_url",
                 "image_url": {"url": _img_to_data_url(img, self.max_side)},
             })
+        last: Optional[LlmError] = None
+        for model in self.models:
+            try:
+                text = self._ask(model, content)
+                self.model_used = model
+                return _strip_reasoning(text)
+            except _RetryableLlmError as e:
+                last = e
+                _log.warning("模型 %s 调用失败，换下一个: %s", model, e)
+        raise last or LlmError("没有可用模型（检查 llm.model / llm.fallback_models）")
+
+    def _ask(self, model: str, content: List[dict]) -> str:
         payload = {
-            "model": self.model,
+            "model": model,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": content},
@@ -263,19 +320,25 @@ class Advisor:
                 detail = e.read().decode("utf-8", "ignore")[:300]
             except Exception:  # noqa: BLE001
                 pass
-            _log.error("大模型 HTTP %d 失败 model=%s: %s", e.code, self.model, detail)
-            raise LlmError(f"HTTP {e.code} 调用失败: {detail}") from e
-        except urllib.error.URLError as e:
-            _log.error("大模型网络错误 model=%s: %s", self.model, e.reason)
-            raise LlmError(f"网络错误: {e.reason}") from e
+            _log.error("大模型 HTTP %d 失败 model=%s: %s", e.code, model, detail)
+            message = f"HTTP {e.code} 调用失败: {detail}"
+            if e.code in (408, 429, 500, 502, 503, 504):
+                raise _RetryableLlmError(message) from e
+            raise LlmError(message) from e
+        except (urllib.error.URLError, TimeoutError) as e:
+            reason = getattr(e, "reason", e)
+            _log.error("大模型网络错误 model=%s: %s", model, reason)
+            raise _RetryableLlmError(f"网络错误: {reason}") from e
         try:
             text = body["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
-            _log.error("大模型返回结构异常 model=%s: %s", self.model, json.dumps(body)[:300])
+            _log.error("大模型返回结构异常 model=%s: %s", model, json.dumps(body)[:300])
             raise LlmError(f"返回结构异常: {json.dumps(body)[:300]}") from None
+        if isinstance(text, list):  # 少数网关把 content 返回成分段数组
+            text = "".join(p.get("text", "") for p in text if isinstance(p, dict))
         _log.debug("大模型调用完成 model=%s 图片=%s 返回 %d 字",
-                   self.model, img is not None, len(text or ""))
-        return text
+                   model, len(content) > 1, len(text or ""))
+        return text or ""
 
     # ---------- 业务封装 ----------
     def choose(self, img: np.ndarray, candidates: List[dict], goal: str = "",
@@ -298,7 +361,7 @@ class Advisor:
         )
         started = time.time()
         lines = [
-            f"{decision_log.stamp()}  source=mcpserver  model={self.model}"
+            f"{decision_log.stamp()}  source=mcpserver  model={self.model_used}"
             f"  可点 {len(candidates)} 项  只读 {len(context)} 项",
             f"目标：{decision_log.one_line(goal or '推进当前任务')}",
         ]

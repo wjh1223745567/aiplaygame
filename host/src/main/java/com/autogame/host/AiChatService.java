@@ -162,6 +162,7 @@ public class AiChatService {
             long llmStart = System.currentTimeMillis();
             try {
                 raw = llm.chat(payload);
+                turn.useModel(llm.modelUsed());
             } catch (Exception e) {
                 log.warn("AI 调用失败: {}", e.toString());
                 turn.round(round, System.currentTimeMillis() - llmStart, null, null)
@@ -517,7 +518,8 @@ public class AiChatService {
         private final String session;
         private final String user;
         private final boolean vision;
-        private final String model;
+        /** 实际调用的模型：限流降级后会变成备用模型，每轮更新。 */
+        private String model;
         private final int maxRounds;
         private final long startedAt = System.currentTimeMillis();
         private final List<Map<String, Object>> rounds = new ArrayList<>();
@@ -529,6 +531,13 @@ public class AiChatService {
             this.vision = vision;
             this.model = model;
             this.maxRounds = maxRounds;
+        }
+
+        /** 记录本轮实际用的模型（限流降级时日志能看到真相）。 */
+        void useModel(String name) {
+            if (name != null && !name.isBlank()) {
+                this.model = name;
+            }
         }
 
         /** 登记一轮模型调用，返回可继续补充工具结果的记录。 */

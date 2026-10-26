@@ -47,6 +47,7 @@ autogame/
 │   ├── run-host.sh          # 按需构建并运行 host（源文件比 jar 新就重构建）
 │   ├── run-chat.sh          # 对话调试台（构建并运行 mcpclient/target/chat.jar）
 │   ├── run-mcpserver.sh     # 以 Streamable HTTP 常驻 mcpserver（容器化 host 用）
+│   ├── docker-host.sh       # 构建/启动 host 容器（基础镜像自愈 + 增量构建）
 │   ├── build-client-win.sh  # 打 Windows 便携客户端（client.jar + JRE + bat -> zip）
 │   └── crop_template.py     # 从 debug/ 截图裁 UI 模板图 -> assets/templates/<name>.png
 ├── assets/                  # 模板图、YOLO 权重（与 mcpserver 共用）
@@ -132,6 +133,29 @@ java -jar host/target/host.jar --action=chat --message="现在是什么界面" -
 6）、`chat_vision`（默认是否附图，默认 true）。对话均走 `/ai/chat`，工具清单由 MCP `listTools()`
 实时生成，Python 侧加工具后无需改 Java。
 
+### 免费模型的限流与自动降级
+
+智谱的免费视觉模型（`glm-4v-flash`）在高峰期会返回 `HTTP 429 code 1305「该模型当前访问量过大」`，
+以前这会直接把整轮对话打成失败。现在按名单降级：
+
+```json
+"model": "glm-4v-flash",
+"fallback_models": ["glm-4.1v-thinking-flash"]
+```
+
+- 逐个尝试，只对「换模型可能成功」的失败降级：`408/429/5xx`、超时、连接失败；`400/401` 直接报错。
+- 主模型被限后冷却 120 秒，期间把备用模型排到前面，不再每轮先撞一次 429 白等几秒。
+- `glm-4.1v-thinking-flash` 的返回是 `<think>…</think><answer><|begin_of_box|>{…}<|end_of_box|></answer>`，
+  `LlmClient` 会先剥掉这层包装再交给上层解 JSON（普通模型的 ```json 代码块不受影响）。
+- 实测：主模型正常 1.6s；主模型 429 时降级成功，整轮 5.7s。
+
+两个候选都必须是视觉模型——纯文本模型收到 `image_url` 会返回 400，把降级链打断。host（Java）与
+mcpserver（Python）读的是同一份名单，两边都会降级；`ai-decisions.log` 里的 `model=` 记的是实际
+用上的那个，降级时一眼能看出来。
+
+Python 侧额外一条：推理模型未闭合的 `<think>` 直接当本轮失败（而不是从思考里抽花括号当决策），
+避免拿半截思考去点错按钮。
+
 安全约定：**默认只读**——host 按这句话里有没有操作类措辞（打开 / 登录 / 帮我 / 点击 / 扫货…）
 判定本轮是否只读；只读轮里模型一旦想调 `click_point` / `press_key` / `open_game` 等，会被
 host 直接拦截并回一句“已拒绝 …”。同一「工具 + 参数」失败两次或重复三次也会中止并如实转述
@@ -205,6 +229,24 @@ AUTOGAME_LOG_STDERR=INFO ./scripts/run-host.sh chat   # 同时把 INFO 回显到
   WARNING）；目录：`AUTOGAME_ROOT`。文件超过 5MB 轮转为 `mcpserver.log.1`。
 - 日志已加入 `.gitignore`；写失败会自动降级为只出 stderr，不影响工具执行。
 
+### 视觉识别结果（YOLO / OCR）
+
+两层都把“这一帧到底识别到了什么”打在各自的出口（`vision/yolo.detect` 与 `vision/ocr.ocr_image`），
+所以不管从哪个工具进来都能看到：
+
+```text
+INFO  [vision.yolo] YOLO[ui] 检出 5 个 (conf>=0.25 imgsz=640): Information_Display/info(0.71)@362,166 box=(82, 150, 642, 182) | Button/button(0.39)@531,506 box=(503, 483, 559, 529) | …
+INFO  [vision.ocr] OCR 788x619 region=None min_conf=0.50 命中 49 条: '问道'(1.00)@393,14 | '18:10'(0.98)@94,39 | … | …另有 37 条
+DEBUG [vision.screen] OCR 兜底层聚合 37 个 label: ['问道', '101', '18:10', …]
+```
+
+- 每条格式：YOLO `类别名/内部kind(置信度)@中心点 box=框`，OCR `'文本'(置信度)@中心点`。
+- **分级**：INFO 只给前 12 条（行别太长）+ 总数；`AUTOGAME_LOG_LEVEL=DEBUG` 给全量，
+  框内小区域 OCR（`region=…`）也只在 DEBUG 下打。
+- 无检出时只记 DEBUG，不刷 INFO（安静场景每帧一行“没结果”纯属噪声）。
+- 识别结果靠这些日志就能定位「为什么没框到按钮」「OCR 把字认错了」：先看 `conf>=` 与
+  `imgsz=`，再看单框置信度，最后看框内 `region=…` 那条 ocr 日志。
+
 ## 5. Docker 部署（host 进容器，mcpserver 留在宿主机）
 
 `mcpserver` 要操作 macOS 本机窗口（pyobjc/Quartz + pynput + mss），容器里既没有 WindowServer
@@ -213,10 +255,29 @@ AUTOGAME_LOG_STDERR=INFO ./scripts/run-host.sh chat   # 同时把 INFO 回显到
 
 ```bash
 bash scripts/run-mcpserver.sh     # 终端 A：mcpserver 常驻 http://0.0.0.0:18090/mcp
-docker compose up -d              # 终端 B：构建并启动 host 容器，对外 18080
-docker compose logs -f host       # 出现「mcpserver 已就绪」即握手成功
-curl -s localhost:18080/ai/tools  # 应返回 15 个工具
+bash scripts/docker-host.sh       # 终端 B：构建并启动 host 容器，对外 18080（等到 healthy）
+bash scripts/docker-host.sh logs  # 出现「mcpserver 已就绪」即握手成功
+bash scripts/docker-host.sh restart  # 改了 host/config.json（换模型、换 key）后必须重启
+curl -s localhost:18080/ai/tools  # 应返回 count=17（17 个工具）
 ```
+
+`host/config.json` 是挂载进容器的（`./:/app`），进程只在启动时读一次：只跑 `up` 不会重启
+容器（compose 认为镜像没变，容器保持 Running），配置不会生效。改配置请用 `restart`。
+
+### 为什么以前构建很慢，现在怎么保证快
+
+`docker compose build` 「很慢」几乎都卡在同一处：基础镜像 `eclipse-temurin:21-jre` 不在本地时，
+BuildKit 要先连 Docker Hub 解析 metadata 再拉 341MB，而国内直连通常不通——实测这一跳会重试
+**259 秒**才失败，真正的构建只要 0.4 秒。三件事已经固化下来：
+
+- `scripts/docker-host.sh` 先把基础镜像备到本地（本地 → 离线 tar → 三个国内镜像源，逐个尝试），
+  再交给 compose；镜像被清掉时会自动恢复，不用手工 pull
+- `bash scripts/docker-host.sh save-base` 把基础镜像导出到 `.tools/docker-base-jre21.tar`
+  （已 gitignore，352MB），Docker 被 prune 后也能离线恢复（实测 2.6 秒）
+- 构建上下文收到 `host/` 一个目录（`context: ./host`），不再把 1.8G 仓库交给 daemon
+  扫描，`host/config.json` 里的密钥也不会进上下文
+
+实测（基础镜像就绪后）：`build` 0.4s，`up` 含启动与健康检查 6.8s。
 
 | 变量 | 作用 | 默认 |
 | --- | --- | --- |
@@ -226,9 +287,11 @@ curl -s localhost:18080/ai/tools  # 应返回 15 个工具
 | `AUTOGAME_ROOT` | 容器内找配置/写日志/读截图的根目录 | `/app`（compose 挂载整个仓库） |
 | `LLM_API_KEY` | 覆盖 `host/config.json` 里的密钥 | 空（用配置文件里的） |
 | `HOST_BASE_IMAGE` | 构建 host 镜像的基础镜像 | `eclipse-temurin:21-jre` |
+| `DOCKER_PULL_TIMEOUT` | 拉基础镜像时单个源的超时（秒，仅脚本层生效） | `240` |
 
 Docker Hub 直连在国内经常不通，表现为 `docker compose build` 长时间无输出（daemon 卡在连
-`registry-1.docker.io` 上重试）。先换镜像源再构建：
+`registry-1.docker.io` 上重试）。`scripts/docker-host.sh` 已内置镜像源回退；如果三个源都不行，
+手工换源再构建：
 
 ```bash
 docker pull docker.1ms.run/library/eclipse-temurin:21-jre

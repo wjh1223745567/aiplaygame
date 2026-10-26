@@ -1,0 +1,11 @@
+# 构建上下文是 host/ 目录（不是仓库根）：daemon 要先遍历整个上下文才能应用
+# .dockerignore，仓库根有 2.7 万个文件（光 mcpserver/.venv 就 1.1G），单这一项
+# 就能耗掉 4 分钟——上下文收到这一个目录后只剩 29 个文件，构建 <1s。
+#
+# 镜像里只需要打好的 jar：源码、pom、配置（含密钥）都不进上下文。
+src
+pom.xml
+config.json
+config.example.json
+target/*
+!target/host.jar

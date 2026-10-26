@@ -318,6 +318,9 @@ def _label_regions(results: List[OcrResult], claimed: List[Box]) -> List[Region]
             points=points,
             meta={},
         ))
+    if regions:
+        _log.debug("OCR 兜底层聚合 %d 个 label: %s", len(regions),
+                   [r.text[:16] for r in regions])
     return regions
 
 
