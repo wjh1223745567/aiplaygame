@@ -14,3 +14,7 @@ rapidocr-onnxruntime
 ultralytics>=8.3.0
 # MCP 官方 Python SDK（MCPServer + stdio；2.x 已把 FastMCP 更名为 MCPServer）
 mcp[cli]
+
+# 回归用例（mcpserver/tests）不强制依赖 pytest：装了就直接 `pytest mcpserver/tests`，
+# 没装也能跑 `python mcpserver/tests/run.py`，两条路径是同一批用例。
+# pytest
