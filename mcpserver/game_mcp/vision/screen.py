@@ -75,8 +75,13 @@ _TEMPLATE_IOU_DROP = 0.5    # 与模板命中重叠到此程度的 YOLO 框丢�
 _YOLO_IOU_DROP = 0.7        # 两个 YOLO 框互相重叠到此程度时只留置信度高的
 _ROW_JOIN_GAP = 1.6         # 同一行文字水平间距超过「字高 × 此倍数」就断开
 # 面积超过整图此比例的 YOLO 框当容器处理：不参与可点、也不认领框内文字
-# （未训练/换模型时容易出「整屏一个 Button」这种框，认领文字会把兜底候选吃干）
-_CONTAINER_AREA_RATIO = 0.35
+# （未训练/换模型时容易出「整屏一个 Button」这种框，认领文字会把兜底候选吃干）。
+# 实测 UITag 会在 31%~40% 之间飘：同一个 NPC 对话面板，日志里出现过 36%，重跑一次
+# 就变成 33.8%——刚好掉到阈值下面，于是那个 icon 框把三条任务行吞成一个候选。
+_CONTAINER_AREA_RATIO = 0.30
+# 面积不够大，但框内读出这么多行互不相干的文字，同样按容器处理：按钮只有一个标签，
+# 面板/对话区才有成片文字。这条不依赖面积，模型换一版也不会失效。
+_CONTAINER_TEXT_LINES = 3
 
 
 @dataclass
@@ -368,10 +373,19 @@ def _yolo_regions(ctx, img: np.ndarray, ocr_min_conf: float,
         text, points = "", []
         if short_side >= _MIN_BOX_SIDE and not is_container and not is_entity:
             try:
-                text, points = _texts_in(ocr_image(img, min_confidence=ocr_min_conf,
-                                                   region=box))  # type: ignore[arg-type]
+                raw = ocr_image(img, min_confidence=ocr_min_conf,
+                                region=box)  # type: ignore[arg-type]
             except Exception as e:  # noqa: BLE001
+                raw = []
                 _log.debug("YOLO 框内 OCR 失败（%s），仅保留区域", e)
+            text, points = _texts_in(raw)
+            if len(points) >= _CONTAINER_TEXT_LINES:
+                # 一块「图标」里读出三行以上互不相干的文字：它是面板/对话区而不是按钮。
+                # 不降级的话，这几行会被合成一个候选（「文殊天尊 …【师门】师门任务 …
+                # 【随机师门】特等」），模型只能盲选，点了也容易落到错的行上。
+                _log.info("图标框 %s 内含 %d 行文字（%s…），按容器处理，文字交回选项/兜底层",
+                          box, len(points), text[:18])
+                is_container, kind, text, points = True, "info", "", []
         regions.append(Region(
             kind="entity" if is_entity else kind,
             box=box,                                    # type: ignore[arg-type]
@@ -421,7 +435,7 @@ def option_regions(img: np.ndarray, top_box: Box, results: List[OcrResult],
     彩色字不会被误当选项——它们不在面板内。已被模板/检测层认领的行不进（否则
     「离开」会同时出现一个 YOLO 按钮和一个 option 选项）。
     为什么不靠 YOLO 认这些行：UITag 在整个对话区只给一个 Visual_Elements/icon 大框（占屏
-    36%，刚过容器阈值被降级成 info），选项本身根本没有可点信号。
+    31%~34%，经常刚好掉在容器阈值下面），选项本身根本没有可点信号。
     """
     out: List[Region] = []
     for r in results:
