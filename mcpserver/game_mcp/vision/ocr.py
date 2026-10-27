@@ -4,9 +4,8 @@
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import cv2
 import numpy as np
@@ -95,7 +94,7 @@ def ocr_image(img: np.ndarray, min_confidence: float = 0.5,
             box = tuple(int(v / upscale) for v in box)  # type: ignore
         results.append(OcrResult(text=text.strip(), confidence=conf, box=box))  # type: ignore
     # 整图 OCR 每帧只跑一次、内容是排查第一手依据 -> info；
-    # 框内小区域 OCR（每个 YOLO 框一次）数量级大得多 -> 只在 DEBUG 下打。
+    # 框内小区域 OCR（每个模板框一次）数量级大得多 -> 只在 DEBUG 下打。
     log = _log.info if region is None else _log.debug
     if results:
         limit = None if verbose() else _LOG_ITEMS
@@ -105,30 +104,3 @@ def ocr_image(img: np.ndarray, min_confidence: float = 0.5,
         _log.debug("OCR %dx%d region=%s min_conf=%.2f 无文字",
                    full_w, full_h, region, min_confidence)
     return results
-
-
-def find_text(img: np.ndarray, keyword: str, exact: bool = False,
-              min_confidence: float = 0.5,
-              region: Optional[Tuple[int, int, int, int]] = None) -> Optional[OcrResult]:
-    """在当前画面中查找包含 keyword 的文本，返回置信度最高的一个。"""
-    return match_text(ocr_image(img, min_confidence=min_confidence, region=region),
-                      keyword, exact=exact)
-
-
-def match_text(results: List[OcrResult], keyword: str,
-               exact: bool = False) -> Optional[OcrResult]:
-    """在已识别结果列表中查找 keyword（避免对同一图重复 OCR）。"""
-    target = _normalize(keyword)
-    best: Optional[OcrResult] = None
-    for r in results:
-        norm = _normalize(r.text)
-        if (norm == target) if exact else (target in norm):
-            if best is None or r.confidence > best.confidence:
-                best = r
-    return best
-
-
-def _normalize(text: str) -> str:
-    """去掉空白与常见全角/半角差异，便于稳定匹配。"""
-    text = re.sub(r"\s+", "", text)
-    return text.translate(str.maketrans("（）：，０１２３４５６７８９", "():,0123456789"))

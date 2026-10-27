@@ -51,7 +51,7 @@ def test_frame_returns_decodable_jpeg():
 
 def test_frame_without_window_is_503_with_reason():
     def boom():
-        raise server.WindowNotFound("未找到游戏窗口（请先 open_game 或手动打开游戏）")
+        raise server.WindowNotFound("未找到游戏窗口（请手动打开游戏窗口）")
 
     with _PatchedCtx(boom):
         response = _call_handler()
@@ -81,7 +81,7 @@ class _PatchedCtx:
 
     def __enter__(self):
         self.original = server._make_ctx
-        server._make_ctx = lambda dry_run=False: self.factory()
+        server._make_ctx = lambda: self.factory()
         return self
 
     def __exit__(self, *_exc):

@@ -108,10 +108,6 @@ public final class McpClientFactory implements AutoCloseable {
         return tools;
     }
 
-    public McpSyncClient client() {
-        return client;
-    }
-
     /** 项目根：AUTOGAME_ROOT 优先（容器里可能只挂载了 config/debug，不再要求带 Python 源码），
      *  其次从 user.dir 向上找标志文件。 */
     public static Path resolveProjectRoot() {

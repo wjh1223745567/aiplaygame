@@ -1,9 +1,7 @@
-# 问道游戏自动化 · MCP Server 依赖（装进 mcpserver/.venv，Python 3.13）
+# 视觉识别 MCP Server 依赖（装进 mcpserver/.venv，Python 3.13）
 numpy
 opencv-python
-Pillow
 mss
-pynput
 pyobjc-core
 pyobjc-framework-Cocoa
 pyobjc-framework-Quartz
@@ -15,6 +13,6 @@ ultralytics>=8.3.0
 # MCP 官方 Python SDK（MCPServer + stdio；2.x 已把 FastMCP 更名为 MCPServer）
 mcp[cli]
 
-# 回归用例（mcpserver/tests）不强制依赖 pytest：装了就直接 `pytest mcpserver/tests`，
-# 没装也能跑 `python mcpserver/tests/run.py`，两条路径是同一批用例。
+# 回归用例（mcpserver/tests）不强制依赖 pytest：装了就 直接 `pytest mcpserver/tests`，
+# 没装也能跑 `python mcpserver/tests/run.py`，两条路径 是同一批用例。
 # pytest

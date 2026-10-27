@@ -17,7 +17,7 @@
   <version>0.1.0-SNAPSHOT</version>
   <packaging>pom</packaging>
   <name>autogame-parent</name>
-  <description>问道游戏自动化：host(Java 宿主) + mcpclient(Java/MCP SDK) + mcpserver(Python/MCP)</description>
+  <description>视觉识别服务：host(Java 门面) + mcpclient(Java/MCP SDK) + mcpserver(Python/MCP)</description>
 
   <modules>
     <module>mcpclient</module>

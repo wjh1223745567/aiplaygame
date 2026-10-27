@@ -1,73 +1,76 @@
 package com.autogame.client;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * 对话式调试台：用自然语言驱动 host 的 AI 服务，实时看到 AI 选了哪些 MCP 工具、参数与返回值。
+ * 工具调用台：直接调 host 的 {@code /ai/invoke}，看每个识别工具返回什么。
  *
- * <p>职责边界：本类<b>不做</b>任何决策，只负责「发一句话 -> 打印 AI 的工具调用明细与回答」；
- * 大模型调用与会话上下文都在 host（{@code /ai/chat}）里，工具执行则在 mcpserver。
+ * <p>职责边界：本类<b>不做</b>任何决策，也不解释识别结果——只负责把「工具名 + JSON 参数」
+ * 发出去，把 host 原样返回的 JSON 打印出来。工具执行在 mcpserver，转发在 host。
  *
  * <pre>
- * bash scripts/run-host.sh serve        # 先起 host（AI 服务，18080）
- * bash scripts/run-chat.sh              # 再进对话调试台
+ * bash scripts/run-host.sh              # 先起 host（18080）
+ * bash scripts/run-chat.sh              # 再进调用台
+ * bash scripts/run-chat.sh --tool=detect --args='{"max_n":20}'   # 单次调用（冒烟）
  * </pre>
  *
- * 除自然语言外还支持 {@code :} 开头的本地命令（:help 查看）。
+ * 提示符下输入格式为 {@code 工具名 [JSON 参数]}，{@code :} 开头的是本地命令（:help 查看）。
  */
 public class ChatConsole {
 
     private static final String HELP = """
-            可用命令（都以 : 开头，其余输入都会转成对话发给 host）：
-              :help              显示本帮助
-              :tools             列出 mcpserver 当前暴露的工具（MCP listTools）
-              :history           打印本轮会话的原始 messages（排查 AI 为何这么选）
-              :reset             清空当前会话上下文
-              :vision            查看/切换截图开关（:vision on | :vision off）
-              :session <id>      切换会话 id（不同 id 上下文互相隔离）
-              :q                 退出
+            可用命令（都以 : 开头）：
+              :help             显示本帮助
+              :tools            列出 mcpserver 当前暴露的只读工具
+              :frame [路径]      抓一帧当前画面存成 JPEG（默认系统临时目录）
+              :q                退出
+
+            其余输入就是一次工具调用，格式：工具名 [JSON 参数]
+              ping
+              list_windows
+              ocr
+              ocr {"region":[0,0,1200,800],"min_confidence":0.6}
+              detect {"max_n":20}
             """;
+
+    private static final ObjectMapper JSON = new ObjectMapper();
+    /** 返回体可能很长（一屏几十个识别框），打印时给个上限，别把终端刷爆。 */
+    private static final int MAX_PRINT_CHARS = 6000;
 
     private final String base;
     private final HostClient host;
     private final BufferedReader in;
 
-    private String session;
-    /** null 表示不指定，交给 host 的 llm.chat_vision 默认值。 */
-    private Boolean vision;
-
-    public ChatConsole(String base, String session, Boolean vision) {
+    public ChatConsole(String base) {
         this.host = new HostClient(base);
         this.base = host.base();
-        this.session = session;
-        this.vision = vision;
         this.in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
     }
 
     public static void main(String[] args) {
         Map<String, String> opts = parseOptions(args);
         if (opts.containsKey("help")) {
-            System.out.println("用法: java -jar chat.jar [--base=http://localhost:18080] [--session=debug]"
-                    + " [--vision=true|false] [--message=一句话]");
+            System.out.println("用法: java -jar chat.jar [--base=http://localhost:18080]"
+                    + " [--tool=detect] [--args='{\"max_n\":20}']");
             return;
         }
         String base = opts.getOrDefault("base", "http://localhost:18080");
-        String session = opts.getOrDefault("session", "debug");
-        Boolean vision = opts.containsKey("vision") ? Boolean.valueOf(opts.get("vision")) : null;
-
-        ChatConsole console = new ChatConsole(base, session, vision);
-        String message = opts.get("message");
-        // --message 一次性模式，方便脚本冒烟测试
-        int code = message == null ? console.run() : console.once(message);
+        ChatConsole console = new ChatConsole(base);
+        String tool = opts.get("tool");
+        // --tool 一次性模式，方便脚本冒烟测试
+        int code = tool == null ? console.run() : console.once(tool, opts.getOrDefault("args", ""));
         System.exit(code);
     }
 
@@ -79,7 +82,7 @@ public class ChatConsole {
         }
         banner();
         while (true) {
-            System.out.print("你> ");
+            System.out.print("工具> ");
             System.out.flush();
             String line;
             try {
@@ -102,72 +105,73 @@ public class ChatConsole {
                 }
                 continue;
             }
-            ask(text);
+            call(text);
         }
     }
 
-    private int once(String message) {
+    private int once(String tool, String args) {
         if (!healthCheck()) {
             return 1;
         }
-        boolean ok = ask(message);
-        return ok ? 0 : 1;
+        String line = args.isBlank() ? tool : tool + " " + args;
+        return call(line) ? 0 : 1;
     }
 
     /** 启动前先确认 host 在跑，并顺带展示工具数量。 */
     private boolean healthCheck() {
         try {
             JsonNode tools = host.tools();
-            System.out.println("[chat] host: " + base + "，工具 " + tools.path("count").asInt(0) + " 个，会话: " + session);
+            System.out.println("[client] host: " + base + "，工具 " + tools.path("count").asInt(0) + " 个");
             return true;
         } catch (Exception e) {
-            System.err.println("[chat] 连不上 host（" + base + "）：" + HostClient.rootMessage(e));
-            System.err.println("[chat] 先启动 AI 服务：bash scripts/run-host.sh serve");
+            System.err.println("[client] 连不上 host（" + base + "）：" + HostClient.rootMessage(e));
+            System.err.println("[client] 先启动 host：bash scripts/run-host.sh");
             return false;
         }
     }
 
     private void banner() {
-        System.out.println("[chat]");
-        System.out.println("[chat] 截图: " + visionText() + "    输入 :help 看命令，:q 退出");
-        System.out.println("[chat] 例：游戏开了吗 / 现在停在什么界面 / 帮我看看有没有红点提示");
+        System.out.println("[client] 输入 :help 看命令，:q 退出；工具名后可直接跟 JSON 参数");
+        System.out.println("[client] 例：ocr / detect {\"max_n\":20} / :frame");
         System.out.println();
     }
 
-    /** 发一轮对话，打印每一步工具调用与最终回答。返回是否成功。 */
-    private boolean ask(String message) {
+    /** 执行一次工具调用并打印结果；返回是否成功。 */
+    private boolean call(String line) {
+        String[] parts = line.trim().split("\\s+", 2);
+        String tool = parts[0];
+        String raw = parts.length > 1 ? parts[1].trim() : "";
+
+        Map<String, Object> args;
+        try {
+            args = parseArgs(raw);
+        } catch (Exception e) {
+            System.err.println("[参数错误] " + e.getMessage());
+            System.err.println("           示例：detect {\"max_n\":20}");
+            return false;
+        }
+
         System.out.println();
+        System.out.println("→ " + tool + " " + JSON.valueToTree(args));
         long started = System.currentTimeMillis();
         JsonNode out;
         try {
-            out = host.chat(session, message, vision);
+            out = host.invoke(tool, args);
         } catch (Exception e) {
             System.err.println("[失败] " + HostClient.rootMessage(e));
             return false;
         }
         long ms = System.currentTimeMillis() - started;
 
-        JsonNode steps = out.path("steps");
-        int index = 0;
-        for (JsonNode step : steps) {
-            index++;
-            String args = step.path("args").toString();
-            System.out.println("  ↳ [" + index + "] " + step.path("tool").asText()
-                    + " " + args + "  " + step.path("ms").asLong() + "ms"
-                    + (step.path("error").asBoolean() ? " [出错]" : ""));
-            printBlock(step.path("result").asText(""), "       ");
-        }
-
-        String reply = out.path("reply").asText("");
-        if (out.path("ok").asBoolean(false)) {
-            System.out.println("AI> " + reply.replace("\n", "\n    "));
+        boolean ok = out.path("ok").asBoolean(false);
+        if (ok) {
+            printJson(out.path("result"));
         } else {
-            System.out.println("AI(未完成)> " + reply.replace("\n", "\n    "));
+            System.err.println("[失败] " + out.path("error").asText(""));
         }
-        System.out.println("    （" + index + " 次工具调用 / " + out.path("rounds").asInt(0)
-                + " 轮模型请求 / " + ms + "ms）");
+        System.out.println("   （" + ms + "ms）");
         System.out.println();
-        return out.path("ok").asBoolean(false);
+        return ok;
     }
 
     // ---------- 本地命令 ----------
@@ -184,14 +188,8 @@ public class ChatConsole {
                 }
                 case ":help", ":h", ":?" -> System.out.println(HELP);
                 case ":tools" -> printTools(host.tools());
-                case ":history" -> printHistory(host.history(session));
-                case ":reset" -> {
-                    JsonNode out = host.reset(session);
-                    System.out.println("[chat] 已清空会话 " + out.path("session").asText(session));
-                }
-                case ":session" -> switchSession(arg);
-                case ":vision" -> switchVision(arg);
-                default -> System.out.println("[chat] 未知命令 " + cmd + "，输入 :help 查看");
+                case ":frame" -> saveFrame(arg);
+                default -> System.out.println("[client] 未知命令 " + cmd + "，输入 :help 查看");
             }
         } catch (Exception e) {
             System.err.println("[失败] " + HostClient.rootMessage(e));
@@ -199,42 +197,32 @@ public class ChatConsole {
         return true;
     }
 
-    private void switchSession(String arg) {
-        if (arg.isEmpty()) {
-            System.out.println("[chat] 当前会话: " + session);
-            return;
-        }
-        session = arg;
-        System.out.println("[chat] 已切换会话: " + session + "（历史独立）");
-    }
-
-    private void switchVision(String arg) {
-        if (arg.isEmpty()) {
-            System.out.println("[chat] 截图当前为: " + visionText());
-            return;
-        }
-        if ("on".equalsIgnoreCase(arg) || "true".equalsIgnoreCase(arg)) {
-            vision = Boolean.TRUE;
-        } else if ("off".equalsIgnoreCase(arg) || "false".equalsIgnoreCase(arg)) {
-            vision = Boolean.FALSE;
-        } else {
-            System.out.println("[chat] 用法: :vision on | :vision off");
-            return;
-        }
-        System.out.println("[chat] 截图已切换为: " + visionText() + "（下一轮生效）");
-    }
-
-    private String visionText() {
-        if (vision == null) {
-            return "跟随 host 配置（llm.chat_vision）";
-        }
-        return vision ? "开（每轮附当前画面）" : "关（只发文字）";
+    /** 抓一帧存成文件：命令行里没法看图，至少给个路径让用户自己打开。 */
+    private void saveFrame(String target) throws IOException, InterruptedException {
+        byte[] jpeg = host.frame();
+        Path path = target.isEmpty()
+                ? Path.of(System.getProperty("java.io.tmpdir"), "autogame-frame.jpg")
+                : Path.of(target);
+        Files.write(path, jpeg);
+        System.out.println("[frame] 已保存 " + path.toAbsolutePath()
+                + "（" + Math.max(1, jpeg.length / 1024) + "KB）");
     }
 
     // ---------- 打印 ----------
 
+    private static Map<String, Object> parseArgs(String raw) throws IOException {
+        if (raw.isEmpty()) {
+            return Map.of();
+        }
+        if (!raw.startsWith("{")) {
+            throw new IllegalArgumentException("参数必须是 JSON 对象，当前是: " + raw);
+        }
+        return JSON.readValue(raw, JSON.getTypeFactory()
+                .constructMapType(LinkedHashMap.class, String.class, Object.class));
+    }
+
     private static void printTools(JsonNode out) {
-        System.out.println("[tools] 共 " + out.path("count").asInt(0) + " 个：");
+        System.out.println("[tools] 共 " + out.path("count").asInt(0) + " 个（全部只读）：");
         for (JsonNode tool : out.path("tools")) {
             String name = tool.path("name").asText();
             String desc = tool.path("description").asText("");
@@ -249,25 +237,20 @@ public class ChatConsole {
         }
     }
 
-    private static void printHistory(JsonNode out) {
-        JsonNode messages = out.path("messages");
-        System.out.println("[history] 会话 " + out.path("session").asText() + "，"
-                + messages.size() + " 条消息：");
-        int i = 0;
-        for (JsonNode message : messages) {
-            i++;
-            String content = message.path("content").isTextual()
-                    ? message.path("content").asText()
-                    : message.path("content").toString();
-            System.out.println("  " + i + ". [" + message.path("role").asText() + "] " + HostClient.oneLine(content, 300));
+    /** 结果按缩进 JSON 打印，长内容截断——终端里看的是结构，不是完整数据。 */
+    private static void printJson(JsonNode node) {
+        String text;
+        try {
+            text = JSON.writerWithDefaultPrettyPrinter().writeValueAsString(node);
+        } catch (Exception e) {
+            text = String.valueOf(node);
         }
-    }
-
-    private static void printBlock(String text, String indent) {
-        if (text == null || text.isEmpty()) {
-            return;
+        if (text.length() > MAX_PRINT_CHARS) {
+            text = text.substring(0, MAX_PRINT_CHARS) + "\n…（已截断，完整结果请用图形客户端或脚本读取）";
         }
-        System.out.println(indent + HostClient.oneLine(text, 900));
+        for (String line : text.split("\n", -1)) {
+            System.out.println("  " + line);
+        }
     }
 
     // ---------- 小工具 ----------

@@ -1,9 +1,9 @@
 """stdio 冒烟测试：用官方 MCP 客户端拉起 game_mcp.server，验证工具往返。
 
 用法：
-    mcpserver/.venv/bin/python mcpserver/smoke_test.py [ping|windows|ocr|capture]
+    mcpserver/.venv/bin/python mcpserver/smoke_test.py [ping|windows|capture|ocr|layout|detect]
 
-默认依次跑 ping -> list_windows；再按需跑 capture/ocr（需游戏窗口在前台）。
+默认依次跑 ping -> list_windows；再按需跑 capture/ocr/layout/detect（需游戏窗口在前台）。
 """
 from __future__ import annotations
 
@@ -63,6 +63,8 @@ def main() -> int:
         "windows": ("list_windows", {}),
         "capture": ("capture", {"tag": "smoke"}),
         "ocr": ("ocr", {}),
+        "layout": ("layout", {}),
+        "detect": ("detect", {}),
     }
     calls = [table[w] for w in which if w in table]
     if not calls:

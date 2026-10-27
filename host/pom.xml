@@ -12,7 +12,7 @@
 
   <artifactId>host</artifactId>
   <name>host</name>
-  <description>宿主层：命令行入口（--action）与 AI 服务（/ai/*），持有 mcpclient 的会话</description>
+  <description>宿主层：HTTP 工具门面（/ai/tools|invoke|frame），持有 mcpclient 的会话</description>
 
   <dependencies>
     <dependency>

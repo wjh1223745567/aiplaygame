@@ -3,7 +3,7 @@
 #
 #   bash scripts/check.sh
 #
-# 用例跑的是真代码路径（四层融合 / 门控 / 去重 / 输入护栏 / 工具入口），只需要
+# 用例跑的是真代码路径（区域融合 / 工具入口 / 抓帧端点），只需要
 # mcpserver/tests/fixtures 里的固定截图，不需要游戏在跑。
 set -euo pipefail
 

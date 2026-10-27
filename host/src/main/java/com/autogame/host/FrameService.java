@@ -14,10 +14,10 @@ import java.time.Duration;
 /**
  * 当前画面快照：转发 mcpserver 的 {@code GET /frame.jpg}。
  *
- * <p>特意不走 {@link GameService}——它整类是 {@code synchronized} 的，一次单步推进能占着锁
- * 十几秒，而「等太久，看一眼画面」恰恰就发生在这段时间里，排在同一条会话后面等于没有。
- * 这里用一条独立的 HTTP 短连接直接问 mcpserver，与 MCP 会话无关，也不抢宿主机侧的写锁
- * （mcpserver 的抓帧端点是只读的），所以正在跑的那一步不受影响。
+ * <p>特意不走 {@link GameService}——它整类是 {@code synchronized} 的，一次 ocr/detect 能占着会话
+ * 好几秒，而「怎么还没出来，看一眼画面」恰恰就发生在这段时间里，排在同一条会话后面等于没有。
+ * 这里用一条独立的 HTTP 短连接直接问 mcpserver，与 MCP 会话无关（mcpserver 的抓帧端点是
+ * 只读的），所以正在跑的那次调用不受影响。
  *
  * <p>只有 Streamable HTTP（{@code AUTOGAME_MCP_URL}）模式才有这个端点：stdio 模式下
  * mcpserver 是 host 自己拉起的子进程，没有对外端口可问。

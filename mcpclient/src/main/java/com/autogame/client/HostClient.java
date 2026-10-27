@@ -11,20 +11,18 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * host 的 HTTP 门面：{@code /ai/chat}、{@code /ai/tools}、{@code /ai/frame}、
- * {@code /ai/history}、{@code /ai/reset}。
+ * host 的 HTTP 门面：{@code /ai/tools}、{@code /ai/invoke}、{@code /ai/frame}。
  *
- * <p>只负责「拼 URL + 收发 JSON」，不做任何决策；控制 台与图形客户端共用。
+ * <p>只负责「拼 URL + 收发 JSON」，不做任何决策；控制台与图形客户端共用。
  * 客户端可以跑在别的机器上（Windows/局域网），所以地址是构造参数而不是常量。
  */
 public class HostClient {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-    /** 一轮对话可能串起多次模型调用，给足时间。 */
+    /** 一轮完整 OCR 可能要几秒，本地大图检测更久，给足时间。 */
     private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(300);
     /** 抓帧要快：慢就说明不在能截图的状态，宁可早点失败也别阻塞界面。 */
     private static final Duration FRAME_TIMEOUT = Duration.ofSeconds(15);
@@ -50,12 +48,9 @@ public class HostClient {
         return request("GET", "/ai/tools", null);
     }
 
-    public JsonNode history(String session) throws IOException, InterruptedException {
-        return request("GET", "/ai/history?session=" + encode(session), null);
-    }
-
-    public JsonNode reset(String session) throws IOException, InterruptedException {
-        return request("POST", "/ai/reset?session=" + encode(session), null);
+    /** 执行一次工具调用；body 就是该工具的参数 JSON（无参传空 Map）。 */
+    public JsonNode invoke(String tool, Map<String, Object> args) throws IOException, InterruptedException {
+        return request("POST", "/ai/invoke?tool=" + encode(tool), args == null ? Map.of() : args);
     }
 
     /**
@@ -78,18 +73,6 @@ public class HostClient {
             throw new IOException("HTTP " + response.statusCode() + ": " + oneLine(text, 300));
         }
         return response.body();
-    }
-
-    /** 一轮对话；vision 传 null 表示跟随 host 的 llm.chat_vision 配置。 */
-    public JsonNode chat(String session, String message, Boolean vision)
-            throws IOException, InterruptedException {
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("message", message);
-        body.put("session", session);
-        if (vision != null) {
-            body.put("vision", vision);
-        }
-        return request("POST", "/ai/chat?session=" + encode(session), body);
     }
 
     public JsonNode request(String method, String path, Map<String, Object> body)

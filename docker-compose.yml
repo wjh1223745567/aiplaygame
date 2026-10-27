@@ -25,16 +25,11 @@ services:
     environment:
       # 指向宿主机上的 mcpserver；改端口时同步改这里
       AUTOGAME_MCP_URL: ${AUTOGAME_MCP_URL:-http://host.docker.internal:18090/mcp}
-      # 配置、判断日志、debug 截图都按这个根目录找
-      AUTOGAME_ROOT: /app
-      # 留空则用挂载进来的 host/config.json 里的 llm.api_key
-      LLM_API_KEY: ${LLM_API_KEY:-}
       TZ: Asia/Shanghai
     extra_hosts:
       # Docker Desktop 自带 host.docker.internal；Linux 上靠这行才有
       - "host.docker.internal:host-gateway"
     volumes:
-      # 挂整个仓库：要读 host/config.json，要把 ai-decisions.log 写回仓库根，
-      # 还要读 mcpserver 截的 debug/*.png（capture 返回的是相对路径）
-      - ./:/app
+      # 日志统一落在宿主机 logs/：容器内写 /app/logs/host.log
+      - ./logs:/app/logs
     restart: unless-stopped

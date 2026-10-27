@@ -4,14 +4,8 @@ __pycache__/
 *.pyc
 .DS_Store
 
-# 大模型判断日志（运行时产物，项目根）
-ai-decisions.log*
-
-# mcpserver 运行日志（运行时产物，项目根）
-mcpserver.log*
-
-# 图形客户端的控制台输出（运行时产物，项目根）
-client.log*
+# 运行日志（host / mcpserver 统一在 logs/ 下）
+logs/
 
 # 项目内运行时（JDK / Python 由 scripts/bootstrap.sh 下载，不入库）
 .tools/
@@ -23,6 +17,5 @@ mcpserver/.venv/
 # 客户端便携包产物（scripts/build-client-win.sh 生成，含内置 JRE，体积大）
 dist/
 
-# 含大模型密钥等敏感信息，不入库；各自用 config.example.json 作模板
-host/config.json
+# 含敏感信息（本机路径等），不入库；用同目录 config.example.json 作模板
 mcpserver/config.json

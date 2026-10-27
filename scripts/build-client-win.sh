@@ -60,8 +60,6 @@ cat > "$DIST/client.properties" <<EOF
 # autogame 客户端配置：host/port 指向 host 的 IP 与端口，界面里改完会自动覆盖本文件
 host=$CLIENT_HOST
 port=$CLIENT_PORT
-session=win
-vision=true
 EOF
 
 [ -f "$DIST/runtime/bin/javaw.exe" ] || { echo "[client] runtime/bin/javaw.exe 缺失，JRE 解压不对" >&2; exit 1; }

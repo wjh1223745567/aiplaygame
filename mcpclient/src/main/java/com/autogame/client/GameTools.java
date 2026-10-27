@@ -10,12 +10,14 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 类型化方法覆盖命令行常用动作：ping / list_windows / game_status / login / back_to_main /
- * close_game / daily_task / market_scan，其余工具一律经 {@link #invoke(String, Map)} 按名字调用。
+ * MCP 工具封装：清单 + 通用调用。
  *
- * <p>所有方法都返回 server 的结构化结果（{@code structuredContent}）；若 server 只返回
- * JSON 文本，则解析后归一化成 Map/List；非 JSON 文本则归一化成 {@code {"result": ...}}。
- * 工具执行失败（{@code isError=true}）统一抛 {@link ToolCallException}。
+ * <p>server 侧只有只读识别工具（ping / list_windows / capture / ocr / layout / detect），
+ * 所以这里不再有类型化的业务方法：参数与结果都原样进出，由调用方自己解释。
+ *
+ * <p>所有方法返回 server 的结构化结果（{@code structuredContent}）；若 server 只返回
+ * JSON 文本，则解析后归一化成 Map/List；非 JSON 文本原样返回字符串。工具执行失败
+ * （{@code isError=true}）统一抛 {@link ToolCallException}。
  */
 public final class GameTools {
 
@@ -27,66 +29,10 @@ public final class GameTools {
         this.client = client;
     }
 
-    // ---------- 基础 ----------
-
-    public Map<String, Object> ping() {
-        return call("ping", Map.of());
-    }
-
-    public List<Map<String, Object>> listWindows() {
-        // server 侧返回 List[dict]，MCP 会把非对象结果包成 {"result": [...]}
-        Object result = callRaw("list_windows", Map.of());
-        if (result instanceof Map<?, ?> map && map.get("result") instanceof List<?> wrapped) {
-            result = wrapped;
-        }
-        List<Map<String, Object>> windows = new ArrayList<>();
-        if (result instanceof List<?> list) {
-            for (Object item : list) {
-                if (item instanceof Map<?, ?> map) {
-                    windows.add(toStringMap(map));
-                }
-            }
-        }
-        return windows;
-    }
-
-    // ---------- 业务 ----------
-
-    /** 检测游戏是否已打开（running / window_visible / pids）。 */
-    public Map<String, Object> gameStatus() {
-        return call("game_status", Map.of());
-    }
-
-    /** 登录：server 侧先自动检测游戏是否打开，未打开时按 autoOpen 决定是否自动启动。 */
-    public Map<String, Object> login(double timeoutSeconds, boolean autoOpen) {
-        return call("login", Map.of("timeout", timeoutSeconds, "auto_open", autoOpen));
-    }
-
-    /** 关闭游戏：先正常退出（可存档），超时未退或 force=true 时强制结束。 */
-    public Map<String, Object> closeGame(double timeoutSeconds, boolean force) {
-        return call("close_game", Map.of("timeout", timeoutSeconds, "force", force));
-    }
-
-    /** 返回主界面：弹窗先关，认不出按钮就按 ESC 逐级退出。 */
-    public Map<String, Object> backToMain(int maxSteps) {
-        return call("back_to_main", Map.of("max_steps", maxSteps));
-    }
-
-    public Map<String, Object> dailyTask(String goal, int maxSteps, boolean dryRun) {
-        return call("daily_task", Map.of("goal", nullToEmpty(goal), "max_steps", maxSteps, "dry_run", dryRun));
-    }
-
-    public Map<String, Object> marketScan(String goal, int maxSteps, boolean dryRun) {
-        return call("market_scan", Map.of("goal", nullToEmpty(goal), "max_steps", maxSteps, "dry_run", dryRun));
-    }
-
-    // ---------- 工具元信息 ----------
-
     /**
-     * 列出 server 侧全部工具（name / description / 参数 schema）。
+     * 列出 server 侧全部工具（name / description / 参数 schema / 必填项）。
      *
-     * <p>host 的 AI 服务用它实时生成提示词里的工具清单，因此 Python 侧新增工具时
-     * 无需改动 Java，避免两边工具描述漂移。
+     * <p>客户端的工具下拉框和 {@code /ai/tools} 都读这一份，Python 侧加工具时无需改 Java。
      */
     public List<Map<String, Object>> toolSpecs() {
         McpSchema.ListToolsResult result = client.listTools();
@@ -98,7 +44,7 @@ public final class GameTools {
             McpSchema.JsonSchema schema = tool.inputSchema();
             Map<String, Object> spec = new LinkedHashMap<>();
             spec.put("name", tool.name());
-            spec.put("description", nullToEmpty(tool.description()));
+            spec.put("description", tool.description() == null ? "" : tool.description());
             spec.put("parameters", schema == null || schema.properties() == null
                     ? Map.of() : schema.properties());
             spec.put("required", schema == null || schema.required() == null
@@ -108,27 +54,11 @@ public final class GameTools {
         return specs;
     }
 
-    // ---------- 调用与归一化 ----------
-
-    /** 通用入口：按工具名 + 参数直接执行，返回归一化后的结构化结果（供 AI 编排）。 */
+    /** 通用入口：按工具名 + 参数直接执行，返回归一化后的结构化结果。 */
     public Object invoke(String toolName, Map<String, Object> arguments) {
-        return callRaw(toolName, arguments == null ? Map.of() : arguments);
-    }
-
-    /** 通用入口：返回结构化结果。 */
-    public Map<String, Object> call(String toolName, Map<String, Object> arguments) {
-        Object structured = callRaw(toolName, arguments);
-        if (structured instanceof Map<?, ?> map) {
-            return toStringMap(map);
-        }
-        return Map.of("result", structured);
-    }
-
-    /** 通用入口：原样返回 structuredContent（可能是 Map 或 List）。 */
-    public Object callRaw(String toolName, Map<String, Object> arguments) {
         McpSchema.CallToolRequest request = McpSchema.CallToolRequest.builder()
                 .name(toolName)
-                .arguments(arguments)
+                .arguments(arguments == null ? Map.of() : arguments)
                 .build();
         McpSchema.CallToolResult result = client.callTool(request);
         if (Boolean.TRUE.equals(result.isError())) {
@@ -175,27 +105,10 @@ public final class GameTools {
         }
     }
 
-    private static Map<String, Object> toStringMap(Map<?, ?> raw) {
-        Map<String, Object> out = new LinkedHashMap<>();
-        raw.forEach((k, v) -> out.put(String.valueOf(k), v));
-        return out;
-    }
-
-    private static String nullToEmpty(String s) {
-        return s == null ? "" : s;
-    }
-
     /** 工具执行失败（server 端返回 isError）。 */
     public static final class ToolCallException extends RuntimeException {
-        private final String toolName;
-
         ToolCallException(String toolName, String message) {
             super("工具 " + toolName + " 执行失败: " + message);
-            this.toolName = toolName;
-        }
-
-        public String toolName() {
-            return toolName;
         }
     }
 }

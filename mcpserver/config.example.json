@@ -6,87 +6,10 @@
   "capture": {
     "debug_dir": "debug"
   },
-  "input": {
-    "click_random_offset": 4,
-    "action_delay_min": 0.12,
-    "action_delay_max": 0.3,
-    "move_duration_sec": 0.18,
-    "stop_hotkey": "f12"
-  },
-  "human_guard": {
-    "enabled": true,
-    "idle_resume_sec": 10,
-    "program_grace_sec": 0.6,
-    "max_pause_sec": 0,
-    "max_block_sec": 30,
-    "watch_clicks": true
-  },
-  "timing": {
-    "step_pause": 0.4,
-    "click_pause": 0.2,
-    "idle_pause": 0.8,
-    "back_step_wait": 1.0,
-    "enter_click_wait": 2.0,
-    "dialog_click_pause": 0.6,
-    "dialog_retry_pause": 0.8,
-    "loading_poll_pause": 1.0,
-    "advance_poll_pause": 1.2,
-    "window_poll_pause": 1.0
-  },
-  "keywords": {
-    "login_buttons": ["进入游戏", "登录游戏"],
-    "enter_buttons": ["进入游戏", "开始游戏", "进入世界", "进入江湖"],
-    "close_buttons": ["我知道了", "知道了", "关闭", "确定", "确认"],
-    "dialog_confirm_buttons": ["我知道了", "知道了", "确定", "确认"],
-    "dialog_hints": ["安全风险", "切换到正常环境"],
-    "loading_hints": ["登录中", "排队", "加载", "连接服务器", "正在连接"],
-    "battle_hints": ["逃跑", "防御", "自动战斗", "法术"],
-    "main_scene_hints": ["商城", "包裹", "背包", "任务", "自动", "地图", "经验"],
-    "main_scene_strong": ["展开", "收起", "天墉城", "天塘城"]
-  },
   "ocr": {
     "engine": "rapidocr",
     "use_det": true,
     "min_confidence": 0.5
-  },
-  "template": {
-    "templates_dir": "assets/templates",
-    "default_threshold": 0.85,
-    "multi_scale": true,
-    "items": {
-      "btn_friend":          {"file": "btn_friend.png",          "kind": "button"},
-      "btn_bag":             {"file": "btn_bag.png",             "kind": "button"},
-      "btn_expand":          {"file": "btn_expand.png",          "kind": "button"},
-      "btn_realtime":        {"file": "btn_realtime.png",        "kind": "button"},
-      "btn_shop_item":       {"file": "btn_shop_item.png",       "kind": "button"},
-      "btn_shop_takeout":    {"file": "btn_shop_takeout.png",    "kind": "button"},
-      "btn_battle_tutorial": {"file": "btn_battle_tutorial.png", "kind": "button"},
-      "btn_party":           {"file": "btn_party.png",           "kind": "button"},
-      "btn_task_accept":     {"file": "btn_task_accept.png",     "kind": "button"},
-      "btn_shimen":          {"file": "btn_shimen.png",          "kind": "button"}
-    }
-  },
-  "vision": {
-    "clickable_kinds": ["button", "icon"],
-    "clickable_sources": ["template", "yolo", "option"],
-    "gate_by_top_layer": true,
-    "option_by_color": true,
-    "collect_failed_shots": true,
-    "max_failed_shots": 300
-  },
-  "yolo": {
-    "enabled": true,
-    "model_path": "assets/models/yolo-ui.pt",
-    "conf_threshold": 0.25,
-    "device": "cpu",
-    "imgsz": 640,
-    "ui_classes": ["button", "task", "info", "dialog", "icon"],
-    "class_map": {
-      "Sidebar": "info",
-      "Visual_Elements": "icon",
-      "Others": "info",
-      "Unknown": "info"
-    }
   },
   "general": {
     "enabled": true,
@@ -95,7 +18,6 @@
     "device": "cpu",
     "imgsz": 1280,
     "classes": ["person"],
-    "default_kind": "entity",
-    "class_map": {}
+    "default_kind": "entity"
   }
 }

@@ -1,15 +1,15 @@
-"""mcpserver 运行日志：统一出口，写项目根的 `mcpserver.log`，同时按需回显到 stderr。
+"""mcpserver 运行日志：统一出口，写项目根 `logs/mcpserver.log`，同时按需回显到 stderr。
 
 为什么不用 print：stdio 传输下 **stdout 就是 MCP 协议通道**，任何 print 都会把
 JSON-RPC 流冲散（host 侧表现为「解析失败 / 连接断开」）。所以这里的日志只走
 文件与 stderr 两条路。
 
-- 文件：项目根 `mcpserver.log`（与 ai-decisions.log 并列），默认 INFO，
-  超过 5MB 轮转为 `mcpserver.log.1`（覆盖上一份）。
+- 文件：`logs/mcpserver.log`，默认 INFO，
+  超过 5MB 轮转为同目录 `mcpserver.log.1`（覆盖上一份）。
 - stderr：默认只出 WARNING 及以上（避免刷脏 host 控制台），
   前台排查时用 `AUTOGAME_LOG_STDERR=INFO` 打开全部。
-- 级别：`AUTOGAME_LOG_LEVEL=DEBUG` 可看到截图/OCR/输入的每一步细节。
-- 目录：`AUTOGAME_ROOT` 可整体搬走日志目录（与 host 侧定位一致）。
+- 级别：`AUTOGAME_LOG_LEVEL=DEBUG` 可看到截图/OCR/检测的每一步细节。
+- 目录：所有日志统一在 `logs/` 下；`AUTOGAME_ROOT` 可整体搬走根目录（与 host 侧一致）。
 """
 from __future__ import annotations
 
@@ -23,6 +23,8 @@ from pathlib import Path
 
 # core/log.py -> core -> game_mcp -> mcpserver -> 项目根
 PROJECT_ROOT = str(Path(__file__).resolve().parents[3])
+# 全部日志（host / mcpserver）统一落在项目根的 logs/ 下
+LOG_DIR = "logs"
 FILE_NAME = "mcpserver.log"
 MAX_BYTES = 5 * 1024 * 1024
 DATEFMT = "%Y-%m-%d %H:%M:%S"
@@ -32,7 +34,7 @@ _configured = False
 
 
 class _BriefFormatter(logging.Formatter):
-    """把 `game_mcp.tools.game` 之类压成 `tools.game`：日志里模块名够用就行。"""
+    """把 `game_mcp.vision.ocr` 之类压成 `vision.ocr`：日志里模块名够用就行。"""
 
     def format(self, record: logging.LogRecord) -> str:
         name = record.name
@@ -41,10 +43,10 @@ class _BriefFormatter(logging.Formatter):
 
 
 def log_path() -> Path:
-    """日志文件位置：AUTOGAME_ROOT 优先，否则项目根。"""
+    """日志文件位置：`<AUTOGAME_ROOT 或项目根>/logs/mcpserver.log`。"""
     env = os.environ.get("AUTOGAME_ROOT")
     base = Path(env) if env and Path(env).is_dir() else Path(PROJECT_ROOT)
-    return base / FILE_NAME
+    return base / LOG_DIR / FILE_NAME
 
 
 def _level(name: str, default: int) -> int:

@@ -2,7 +2,7 @@
 #
 # 构建前先在宿主机打包（必须走项目内 JDK21，否则 mvn 会用系统 Java 8 失败）：
 #   bash -c '. scripts/env.sh && mvn -q -DskipTests package'
-# 或直接 bash scripts/run-host.sh ping（发现有源码比 jar 新时会自动构建）。
+# 或直接 bash scripts/run-host.sh（发现有源码比 jar 新时会自动构建）。
 #
 # 镜像里不编译：单阶段镜像更小更快，也避免构建期拉 maven 依赖。
 #
@@ -17,7 +17,6 @@ ARG BASE_IMAGE=eclipse-temurin:21-jre
 FROM ${BASE_IMAGE}
 
 ENV TZ=Asia/Shanghai \
-    AUTOGAME_ROOT=/app \
     AUTOGAME_MCP_URL=http://host.docker.internal:18090/mcp
 
 WORKDIR /app
@@ -25,7 +24,7 @@ COPY target/host.jar /opt/autogame/host.jar
 
 EXPOSE 18080
 
-# 不带参数 = 常驻 /ai/* 服务；带 --action=xxx = 一次性命令（如 --action=ping）
+# 常驻 /ai/* 工具门面（tools / invoke / frame）
 ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-Dfile.encoding=UTF-8", "-jar", "/opt/autogame/host.jar"]
 
 # 只探 TCP：/ai/tools 会触发 MCP 握手，不适合当存活探针

@@ -3,7 +3,7 @@
 #
 #   bash scripts/docker-host.sh            # 打包 jar + 构建镜像 + 后台启动 + 等健康
 #   bash scripts/docker-host.sh build      # 只构建镜像
-#   bash scripts/docker-host.sh restart    # 重启容器（改了 config.json / 换了 key 用这个）
+#   bash scripts/docker-host.sh restart    # 重启容器（换了 jar 或环境变量用这个）
 #   bash scripts/docker-host.sh logs       # 跟踪容器日志
 #   bash scripts/docker-host.sh status     # 容器状态与健康
 #   bash scripts/docker-host.sh down
@@ -145,11 +145,10 @@ case "$ACTION" in
     trim_build_cache
     ;;
   restart)
-    # config.json 是挂载进容器的，只在启动时读一次：改完必须重建容器进程。
-    # 光跑 `up` 不会重启——compose 认为镜像/配置没变，容器保持 Running。
+    # 镜像是构建产物，光跑 `up` 不会重建——compose 认为镜像没变，容器保持 Running。
     ensure_jar
     docker compose up -d --force-recreate
-    log "已按最新 jar 和 host/config.json 重启容器"
+    log "已按最新 jar 重启容器"
     ;;
   logs)
     docker compose logs -f host

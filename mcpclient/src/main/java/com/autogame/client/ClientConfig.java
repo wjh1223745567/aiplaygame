@@ -8,7 +8,7 @@ import java.nio.file.Path;
 import java.util.Properties;
 
 /**
- * 客户端本地配置：服务地址（IP + 端口）、会话 id、截图开关。
+ * 客户端本地配置：服务地址（IP + 端口）。
  *
  * <p>存在 client.properties：优先 jar 同目录（便携包解压即用，双击 bat 就能带着上次填的 IP 打开），
  * 目录不可写时退回 {@code ~/.autogame/client.properties}。
@@ -23,9 +23,6 @@ public final class ClientConfig {
 
     private String host = DEFAULT_HOST;
     private int port = DEFAULT_PORT;
-    private String session = "win";
-    /** null 表示不指定，交给 host 的 llm.chat_vision 默认值。 */
-    private Boolean vision = null;
 
     private Path path;
 
@@ -48,14 +45,6 @@ public final class ClientConfig {
             config.host = h;
         }
         config.port = parsePort(props.getProperty("port"), config.port);
-        String s = props.getProperty("session", "").trim();
-        if (!s.isEmpty()) {
-            config.session = s;
-        }
-        String v = props.getProperty("vision", "").trim();
-        if (!v.isEmpty()) {
-            config.vision = Boolean.valueOf(v);
-        }
         return config;
     }
 
@@ -63,10 +52,6 @@ public final class ClientConfig {
         Properties props = new Properties();
         props.setProperty("host", host);
         props.setProperty("port", String.valueOf(port));
-        props.setProperty("session", session);
-        if (vision != null) {
-            props.setProperty("vision", String.valueOf(vision));
-        }
         try {
             Path dir = path.getParent();
             if (dir != null) {
@@ -120,28 +105,6 @@ public final class ClientConfig {
         }
     }
 
-    public String session() {
-        return session;
-    }
-
-    public void session(String value) {
-        if (value != null && !value.isBlank()) {
-            session = value.trim();
-        }
-    }
-
-    public Boolean vision() {
-        return vision;
-    }
-
-    public void vision(Boolean value) {
-        vision = value;
-    }
-
-    public Path path() {
-        return path;
-    }
-
     // ---------- 内部 ----------
 
     private static int parsePort(String text, int fallback) {
@@ -180,7 +143,6 @@ public final class ClientConfig {
 
     @Override
     public String toString() {
-        return baseUrl() + " 会话=" + session + " 截图=" + (vision == null ? "跟随 host" : vision)
-                + " 配置=" + path;
+        return baseUrl() + "  配置=" + path;
     }
 }

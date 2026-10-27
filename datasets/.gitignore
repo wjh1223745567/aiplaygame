@@ -1,8 +1,0 @@
-# 训练集图片：体积大，可由 debug/failed_shots + scripts/label_helper.py 重建，不入库
-ui/images/
-
-# 训练产出（权重/曲线/日志）
-runs/
-
-# data.yaml、labels/、proposals.json 保留入库：前者是数据结构定义，
-# 后两者承载人工/AI 筛选的成果，丢了要重标

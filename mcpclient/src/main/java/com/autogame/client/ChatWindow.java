@@ -1,17 +1,17 @@
 package com.autogame.client;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import javax.imageio.ImageIO;
 import javax.swing.ImageIcon;
 import javax.swing.JButton;
-import javax.swing.JCheckBox;
+import javax.swing.JComboBox;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
-import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.JTextPane;
 import javax.swing.KeyStroke;
@@ -30,7 +30,6 @@ import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
 import java.awt.Graphics2D;
-import java.awt.GridLayout;
 import java.awt.RenderingHints;
 import java.awt.event.ActionEvent;
 import java.awt.event.ComponentAdapter;
@@ -47,14 +46,13 @@ import java.util.Map;
 import java.util.concurrent.ExecutionException;
 
 /**
- * Windows 图形客户端：填 host 的 IP/端口 -> 连接 -> 自然语言驱动。
+ * Windows 图形客户端：填 host 的 IP/端口 -> 连接 -> 选工具、填参数、看结果。
  *
- * <p>和 {@link ChatConsole} 一样只做「发一句话、看 AI 调了哪些工具」，决策与工具执行都在
- * host / mcpserver 侧。地址、会话、截图开关会写进 client.properties，下次打开自动带出。
+ * <p>和 {@link ChatConsole} 一样只做「发一次工具调用、看返回的 JSON」，识别在 mcpserver，
+ * 转发在 host。地址会写进 client.properties，下次打开自动带出。
  *
- * <p>右侧是当前画面快照（host 的 {@code /ai/frame}）：不按秒轮询，只有手动点「看当前画面」、
- * 或本轮以「绕圈/卡住」收场时才抓一帧。这一步走的是独立 HTTP，不等候正在执行的那一步，
- * 所以“看着像卡住了”的时候至少能看到游戏停在哪里。
+ * <p>右侧是当前画面快照（host 的 {@code /ai/frame}）：不按秒轮询，只在你点「看当前画面」
+ * 或刚连上时抓一帧。它走独立 HTTP，不占用工具会话，所以正在跑 OCR/检测时也能看。
  *
  * <pre>
  * java -jar client.jar                        # 读 client.properties，默认 192.168.0.31:18080
@@ -65,33 +63,31 @@ import java.util.concurrent.ExecutionException;
 public final class ChatWindow extends JFrame {
 
     private static final Color INK = new Color(0x1F2328);
-    private static final Color USER = new Color(0x1F4E79);
-    private static final Color AI = new Color(0x146C43);
+    private static final Color REQUEST = new Color(0x1F4E79);
+    private static final Color RESULT = new Color(0x146C43);
     private static final Color ERROR = new Color(0xB42318);
     private static final Color MUTED = new Color(0x6E7781);
     private static final Color VIDEO_BG = new Color(0x0D1117);
-    /** 收尾文案里出现这些字样就算「绕圈/卡住」：只有这种结局才自动抓一帧，其余等用户动手。 */
-    private static final String[] STUCK_HINTS = {
-            "疑似卡住", "没有产生任何动作", "轮数已达上限", "同一操作重复"
-    };
     private static final DateTimeFormatter CLOCK = DateTimeFormatter.ofPattern("HH:mm:ss");
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     private final ClientConfig config;
     private final JTextField hostField;
     private final JTextField portField;
-    private final JTextField sessionField;
     private final JLabel statusLabel = new JLabel("未连接");
-    private final JTextPane chatPane = new JTextPane();
-    private final JTextArea traceArea = new JTextArea(9, 80);
-    private final JTextArea inputArea = new JTextArea(3, 60);
-    private final JCheckBox visionCheck;
-    private final JButton sendBtn = new JButton("发送 (Ctrl+Enter)");
+    private final JTextPane logPane = new JTextPane();
+    private final JComboBox<String> toolBox = new JComboBox<>();
+    private final JTextField argsField = new JTextField(30);
+    private final JLabel toolHint = new JLabel(" ");
+    private final JButton callBtn = new JButton("调用 (Enter)");
     private final JButton connectBtn = new JButton("连 接");
     private final JLabel frameLabel = new JLabel("连上 host 后可见当前画面", SwingConstants.CENTER);
-    private final JLabel frameHint = new JLabel("点「看当前画面」抓一帧（卡住时自动抓一次）");
+    private final JLabel frameHint = new JLabel("点「看当前画面」抓一帧");
     private final JButton frameBtn = new JButton("看当前画面");
 
     private HostClient client;
+    /** 最近一次 /ai/tools 的结果：切换工具时用它显示必填参数与描述。 */
+    private JsonNode tools;
     private boolean busy;
     /** 上一个抓帧请求还没回来（抓帧不能叠着发，否则宿主机排队越堆越长）。 */
     private boolean frameFetching;
@@ -101,16 +97,14 @@ public final class ChatWindow extends JFrame {
     private JSplitPane mainSplit;
 
     public ChatWindow(ClientConfig config) {
-        super("Autogame 客户端");
+        super("Autogame 识别控制台");
         this.config = config;
         this.hostField = new JTextField(config.host(), 14);
         this.portField = new JTextField(String.valueOf(config.port()), 6);
-        this.sessionField = new JTextField(config.session(), 8);
-        this.visionCheck = new JCheckBox("随屏截图", config.vision() == null || config.vision());
 
         setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
-        setMinimumSize(new Dimension(760, 560));
-        setSize(980, 720);
+        setMinimumSize(new Dimension(760, 520));
+        setSize(1000, 700);
         setLocationRelativeTo(null);
         setContentPane(buildContent());
 
@@ -144,8 +138,6 @@ public final class ChatWindow extends JFrame {
         left.add(new JLabel("端口"));
         left.add(portField);
         left.add(connectBtn);
-        left.add(new JLabel("  会话"));
-        left.add(sessionField);
         bar.add(left, BorderLayout.WEST);
         bar.add(statusLabel, BorderLayout.EAST);
 
@@ -156,32 +148,20 @@ public final class ChatWindow extends JFrame {
     }
 
     private JSplitPane buildCenter() {
-        chatPane.setEditable(false);
-        chatPane.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 14));
-        chatPane.setBackground(Color.WHITE);
-        JScrollPane chatScroll = new JScrollPane(chatPane);
-        chatScroll.setBorder(new EmptyBorder(0, 0, 0, 0));
+        logPane.setEditable(false);
+        logPane.setFont(monoFont(12));
+        logPane.setBackground(Color.WHITE);
+        logPane.setForeground(INK);
+        JScrollPane logScroll = new JScrollPane(logPane);
+        logScroll.setBorder(new EmptyBorder(0, 0, 0, 0));
 
-        traceArea.setEditable(false);
-        traceArea.setFont(monoFont(12));
-        traceArea.setForeground(INK);
-        JScrollPane traceScroll = new JScrollPane(traceArea);
-
-        JPanel tracePanel = new JPanel(new BorderLayout(0, 4));
-        tracePanel.add(new JLabel("工具调用明细"), BorderLayout.NORTH);
-        tracePanel.add(traceScroll, BorderLayout.CENTER);
-
-        JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, chatScroll, tracePanel);
-        split.setResizeWeight(0.72);
-        split.setDividerSize(6);
-
-        mainSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, split, buildFramePanel());
-        mainSplit.setResizeWeight(0.74);
+        mainSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, logScroll, buildFramePanel());
+        mainSplit.setResizeWeight(0.72);
         mainSplit.setDividerSize(6);
         return mainSplit;
     }
 
-    /** 右侧画面面板：一眼看到游戏现在停在哪。只给人看，不参与任何决策。 */
+    /** 右侧画面面板：一眼看到游戏现在停在哪。只给人看，不参与任何识别。 */
     private JPanel buildFramePanel() {
         frameLabel.setOpaque(true);
         frameLabel.setBackground(VIDEO_BG);
@@ -212,40 +192,45 @@ public final class ChatWindow extends JFrame {
         panel.add(head, BorderLayout.NORTH);
         panel.add(frameLabel, BorderLayout.CENTER);
         panel.add(foot, BorderLayout.SOUTH);
-        panel.setPreferredSize(new Dimension(340, 0));
+        panel.setPreferredSize(new Dimension(360, 0));
         panel.setMinimumSize(new Dimension(240, 0));
         return panel;
     }
 
     private JPanel buildInputBar() {
-        inputArea.setLineWrap(true);
-        inputArea.setWrapStyleWord(true);
-        inputArea.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 14));
-        // Ctrl+Enter 发送；Enter 留给换行，方便贴多行文字
-        inputArea.getInputMap().put(KeyStroke.getKeyStroke("ctrl ENTER"), "send");
-        inputArea.getActionMap().put("send", new javax.swing.AbstractAction() {
+        toolBox.setEditable(true);
+        toolBox.setPreferredSize(new Dimension(170, 26));
+        toolBox.addActionListener(e -> updateHint());
+
+        argsField.setFont(monoFont(13));
+        argsField.setToolTipText("工具参数（JSON 对象，可留空）");
+        // Enter 直接调用；参数里要换行时用 :args 不方便，所以参数框只收单行
+        argsField.getInputMap().put(KeyStroke.getKeyStroke("ENTER"), "call");
+        argsField.getActionMap().put("call", new javax.swing.AbstractAction() {
             @Override
             public void actionPerformed(ActionEvent e) {
-                send();
+                call();
             }
         });
 
-        JPanel more = new JPanel(new GridLayout(1, 2, 6, 0));
-        more.add(button("历史", this::showHistory));
-        more.add(button("清空", this::resetSession));
+        JPanel row = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        row.add(new JLabel("工具"));
+        row.add(toolBox);
+        row.add(new JLabel("参数"));
+        row.add(argsField);
+        row.add(callBtn);
+        row.add(button("工具列表", this::showTools));
 
-        JPanel buttons = new JPanel(new GridLayout(4, 1, 0, 6));
-        buttons.add(sendBtn);
-        buttons.add(visionCheck);
-        buttons.add(button("工具列表", this::showTools));
-        buttons.add(more);
+        toolHint.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 11));
+        toolHint.setForeground(MUTED);
 
-        JPanel bar = new JPanel(new BorderLayout(8, 0));
-        bar.add(new JScrollPane(inputArea), BorderLayout.CENTER);
-        bar.add(buttons, BorderLayout.EAST);
-        sendBtn.addActionListener(e -> send());
+        JPanel bar = new JPanel(new BorderLayout(0, 4));
+        bar.add(row, BorderLayout.NORTH);
+        bar.add(toolHint, BorderLayout.SOUTH);
+        callBtn.addActionListener(e -> call());
 
-        append("[提示] 先确认 host 已启动（macOS 侧 18080），再点「连接」。地址可随时改，改完回车即重连。\n\n", MUTED, false);
+        append("先确认 host 已启动（macOS 侧 18080），再点「连接」。", MUTED, false);
+        append("连上后选工具、填 JSON 参数（可留空），回车即调用。\n\n", MUTED, false);
         return bar;
     }
 
@@ -283,8 +268,10 @@ public final class ChatWindow extends JFrame {
                 try {
                     JsonNode out = get();
                     client = new HostClient(base);
+                    tools = out;
+                    populateTools(out);
                     int count = out.path("count").asInt(0);
-                    setStatus("已连接 " + base + " · 工具 " + count + " 个", AI);
+                    setStatus("已连接 " + base + " · 工具 " + count + " 个", RESULT);
                     append("[已连接] " + base + "，可用工具 " + count + " 个。\n\n", MUTED, false);
                     refreshFrame(true);
                 } catch (Exception e) {
@@ -299,127 +286,65 @@ public final class ChatWindow extends JFrame {
         }.execute();
     }
 
-    private void send() {
+    /** 调一次工具：参数原样发给 host，返回的 JSON 原样贴到下方。 */
+    private void call() {
         if (busy) {
-            return;
-        }
-        String text = inputArea.getText().trim();
-        if (text.isEmpty()) {
             return;
         }
         if (client == null) {
             append("[提示] 还没连上 host，先点「连接」。\n\n", ERROR, false);
             return;
         }
+        String tool = String.valueOf(toolBox.getEditor().getItem()).trim();
+        if (tool.isEmpty()) {
+            append("[提示] 先选一个工具（点「工具列表」看有哪些）。\n\n", ERROR, false);
+            return;
+        }
+        Map<String, Object> args;
+        try {
+            args = parseArgs(argsField.getText());
+        } catch (Exception e) {
+            append("[参数错误] " + e.getMessage() + "\n           示例：{\"max_n\":20}\n\n", ERROR, false);
+            return;
+        }
         applyFields();
         config.save();
 
-        inputArea.setText("");
-        append("你> " + text + "\n", USER, true);
-        append("[思考中…]\n", MUTED, false);
-        traceArea.append("—— 本轮开始：" + text + System.lineSeparator());
-
-        String session = config.session();
-        Boolean vision = visionCheck.isSelected();
+        append(stamp() + " → " + tool + " " + JSON.valueToTree(args) + "\n", REQUEST, true);
         setBusy(true);
+        long started = System.currentTimeMillis();
         new SwingWorker<JsonNode, Void>() {
             @Override
             protected JsonNode doInBackground() throws Exception {
-                return client.chat(session, text, vision);
+                return client.invoke(tool, args);
             }
 
             @Override
             protected void done() {
                 setBusy(false);
                 try {
-                    JsonNode out = get();
-                    // 平时不自动抓帧：只有这一轮以「绕圈/卡住」收场时才补一张，看它停在哪
-                    String stuck = stuckReason(out);
-                    if (!stuck.isEmpty()) {
-                        refreshFrame(true, stuck);
-                    }
-                    renderReply(out);
+                    renderResult(get(), started);
                 } catch (Exception e) {
                     append("[失败] " + HostClient.rootMessage(unwrap(e)) + "\n\n", ERROR, false);
-                    traceArea.append("—— 本轮失败" + System.lineSeparator());
                 }
             }
         }.execute();
     }
 
-    /** 每一步工具调用都进下方明细，回答进上方对话区。 */
-    private void renderReply(JsonNode out) {
-        StringBuilder trace = new StringBuilder();
-        JsonNode steps = out.path("steps");
-        int index = 0;
-        for (JsonNode step : steps) {
-            index++;
-            trace.append("  - [").append(index).append("] ")
-                    .append(step.path("tool").asText())
-                    .append(' ').append(step.path("args"))
-                    .append("  ").append(step.path("ms").asLong()).append("ms")
-                    .append(step.path("error").asBoolean() ? " [出错]" : "")
-                    .append(System.lineSeparator());
-            String result = step.path("result").asText("");
-            if (!result.isEmpty()) {
-                trace.append("      ").append(HostClient.oneLine(result, 600)).append(System.lineSeparator());
-            }
-        }
-        trace.append("—— 本轮 ").append(index).append(" 次工具调用 / ")
-                .append(out.path("rounds").asInt(0)).append(" 轮模型请求")
-                .append(System.lineSeparator()).append(System.lineSeparator());
-        traceArea.append(trace.toString());
-
-        String reply = out.path("reply").asText("");
+    private void renderResult(JsonNode out, long started) {
+        long ms = System.currentTimeMillis() - started;
         if (out.path("ok").asBoolean(false)) {
-            append("AI> " + reply + "\n\n", AI, false);
+            append(pretty(out.path("result")), INK, false);
+            append("    （" + out.path("tool").asText("") + " 成功 · " + ms + "ms）\n\n", RESULT, false);
         } else {
-            append("AI(未完成)> " + reply + "\n\n", ERROR, false);
+            append("[失败] " + out.path("error").asText("") + "（" + ms + "ms）\n\n", ERROR, false);
         }
     }
 
     // ---------- 画面 ----------
 
-    /**
-     * 本轮是不是「绕圈/卡住」收场：是的话返回一个短标签，否则空串。
-     *
-     * <p>两条来源：mcpserver 侧的画面指纹绕圈（写在 step 的 result 里），和 host 侧的硬限制
-     * （连续几步无动作 / 同一操作重复 / 轮数用完）。这些结局最需要一张图——看它到底停在哪。
-     */
-    private static String stuckReason(JsonNode out) {
-        for (JsonNode step : out.path("steps")) {
-            if (step.path("result").asText("").contains("绕圈")) {
-                return "绕圈";
-            }
-        }
-        if (out.path("ok").asBoolean(true)) {
-            return "";
-        }
-        String reply = out.path("reply").asText("");
-        for (String hint : STUCK_HINTS) {
-            if (reply.contains(hint)) {
-                return "疑似卡住";
-            }
-        }
-        return "";
-    }
-
-    /** 手动/连接时抓一帧（没有额外标签）。 */
+    /** 抓一帧贴到右侧；silent=true 时失败只更新标题下那行小字，不刷记录。 */
     private void refreshFrame(boolean silent) {
-        refreshFrame(silent, "");
-    }
-
-    /**
-     * 拉一帧贴到右侧。
-     *
-     * <p>silent=true 是不带错误刷屏的抓帧：失败只更新画面标题下那行小字
-     * ——抓帧失败往往就是窗口没了/游戏关了，用户此刻在意的不是这个。
-     *
-     * <p>note 非空时写进标题下的小字（如「疑似卡住」），用来区分这张图是怎么来的。
-     *
-     * <p>走的是 host 的 /ai/frame，与发消息的那条请求互不影响，所以一轮对话跑着的时候一样能刷。
-     */
-    private void refreshFrame(boolean silent, String note) {
         HostClient target = client;
         if (target == null) {
             if (!silent) {
@@ -431,7 +356,7 @@ public final class ChatWindow extends JFrame {
             return;
         }
         frameFetching = true;
-        frameHint.setText(stamp() + " 抓取中…" + (note.isEmpty() ? "" : "（" + note + "）"));
+        frameHint.setText(stamp() + " 抓取中…");
         new SwingWorker<byte[], Void>() {
             @Override
             protected byte[] doInBackground() throws Exception {
@@ -442,7 +367,7 @@ public final class ChatWindow extends JFrame {
             protected void done() {
                 frameFetching = false;
                 try {
-                    showFrame(get(), note);
+                    showFrame(get());
                 } catch (Exception e) {
                     String message = HostClient.rootMessage(unwrap(e));
                     frameHint.setText(stamp() + " 抓帧失败：" + HostClient.oneLine(message, 30));
@@ -455,16 +380,14 @@ public final class ChatWindow extends JFrame {
         }.execute();
     }
 
-    private void showFrame(byte[] jpeg, String note) throws IOException {
+    private void showFrame(byte[] jpeg) throws IOException {
         BufferedImage image = ImageIO.read(new ByteArrayInputStream(jpeg));
         if (image == null) {
             throw new IOException("返回内容不是 JPEG（" + jpeg.length + " 字节）");
         }
         frameImage = image;
         renderFrame();
-        // 标签放最前：面板窄，放末尾会被截成「…」，而这张图怎么来的比分辨率重要
-        String text = (note.isEmpty() ? "" : note + " · ") + stamp() + " "
-                + image.getWidth() + "×" + image.getHeight()
+        String text = stamp() + " " + image.getWidth() + "×" + image.getHeight()
                 + " · " + Math.max(1, jpeg.length / 1024) + "KB";
         frameHint.setText(text);
         frameHint.setToolTipText(text);
@@ -500,6 +423,69 @@ public final class ChatWindow extends JFrame {
         return LocalTime.now().format(CLOCK);
     }
 
+    // ---------- 工具清单 ----------
+
+    private void populateTools(JsonNode out) {
+        String previous = String.valueOf(toolBox.getEditor().getItem()).trim();
+        toolBox.removeAllItems();
+        for (JsonNode tool : out.path("tools")) {
+            toolBox.addItem(tool.path("name").asText());
+        }
+        if (!previous.isEmpty() && exists(previous)) {
+            toolBox.setSelectedItem(previous);
+        } else if (toolBox.getItemCount() > 0) {
+            toolBox.setSelectedIndex(0);
+        }
+        updateHint();
+    }
+
+    private boolean exists(String name) {
+        for (JsonNode tool : tools.path("tools")) {
+            if (name.equals(tool.path("name").asText())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 提示行跟着当前选中的工具走：必填参数 + 一句描述。 */
+    private void updateHint() {
+        updateHint(String.valueOf(toolBox.getEditor().getItem()).trim());
+    }
+
+    private void updateHint(String name) {
+        if (name.isEmpty()) {
+            toolHint.setText(" ");
+            toolHint.setToolTipText(null);
+            return;
+        }
+        JsonNode spec = null;
+        if (tools != null) {
+            for (JsonNode tool : tools.path("tools")) {
+                if (name.equals(tool.path("name").asText())) {
+                    spec = tool;
+                    break;
+                }
+            }
+        }
+        if (spec == null) {
+            toolHint.setText("（清单里没有这个工具，点「工具列表」确认名字）");
+            toolHint.setToolTipText(null);
+            return;
+        }
+        JsonNode required = spec.path("required");
+        String need = required.isArray() && !required.isEmpty() ? required.toString() : "无";
+        String desc = spec.path("description").asText("");
+        toolHint.setText("必填参数: " + need + " · " + HostClient.oneLine(desc, 70));
+        StringBuilder tip = new StringBuilder(desc);
+        JsonNode parameters = spec.path("parameters");
+        if (parameters.isObject() && !parameters.isEmpty()) {
+            tip.append("\n\n参数：");
+            parameters.fieldNames().forEachRemaining(field -> tip.append("\n  ").append(field));
+        }
+        toolHint.setToolTipText(tip.toString().isBlank() ? null : tip.toString());
+    }
+
     private void showTools() {
         HostClient target = client;
         if (target == null) {
@@ -508,56 +494,20 @@ public final class ChatWindow extends JFrame {
         }
         runQuietly("工具列表", () -> {
             JsonNode out = target.tools();
-            StringBuilder sb = new StringBuilder("工具 " + out.path("count").asInt(0) + " 个：")
+            tools = out;
+            populateTools(out);
+            StringBuilder sb = new StringBuilder("工具 " + out.path("count").asInt(0) + " 个（全部只读）：")
                     .append(System.lineSeparator());
             for (JsonNode tool : out.path("tools")) {
                 sb.append("  - ").append(tool.path("name").asText()).append("  ")
                         .append(HostClient.oneLine(tool.path("description").asText(""), 80))
                         .append(System.lineSeparator());
             }
-            traceArea.append(sb.toString());
+            append(sb + "\n", MUTED, false);
         });
     }
 
-    private void showHistory() {
-        HostClient target = client;
-        if (target == null) {
-            append("[提示] 先连接。\n\n", ERROR, false);
-            return;
-        }
-        String session = config.session();
-        runQuietly("历史", () -> {
-            JsonNode out = target.history(session);
-            JsonNode messages = out.path("messages");
-            StringBuilder sb = new StringBuilder("会话 " + out.path("session").asText(session)
-                    + " 共 " + messages.size() + " 条消息：").append(System.lineSeparator());
-            int i = 0;
-            for (JsonNode message : messages) {
-                i++;
-                String content = message.path("content").isTextual()
-                        ? message.path("content").asText()
-                        : message.path("content").toString();
-                sb.append("  ").append(i).append(". [").append(message.path("role").asText()).append("] ")
-                        .append(HostClient.oneLine(content, 300)).append(System.lineSeparator());
-            }
-            traceArea.append(sb.toString());
-        });
-    }
-
-    private void resetSession() {
-        HostClient target = client;
-        if (target == null) {
-            append("[提示] 先连接。\n\n", ERROR, false);
-            return;
-        }
-        String session = config.session();
-        runQuietly("清空", () -> {
-            target.reset(session);
-            append("[已清空] 会话 " + session + " 的上下文已重置。\n\n", MUTED, false);
-        });
-    }
-
-    /** 只读操作统一走这里：后台线程跑，失败写进对话区，不弹窗打断。 */
+    /** 只读操作统一走这里：后台线程跑，失败写进记录区，不弹窗打断。 */
     private void runQuietly(String what, ThrowingAction action) {
         if (busy) {
             return;
@@ -591,17 +541,14 @@ public final class ChatWindow extends JFrame {
         } catch (NumberFormatException ignored) {
             // 输错就保留上一次的端口，避免把配置写成脏值
         }
-        config.session(sessionField.getText());
-        config.vision(visionCheck.isSelected());
         // host() 可能从 "http://ip:port" 里拆出端口，回填让用户看到真实生效值
         hostField.setText(config.host());
         portField.setText(String.valueOf(config.port()));
-        sessionField.setText(config.session());
     }
 
     private void setBusy(boolean value) {
         busy = value;
-        sendBtn.setEnabled(!value);
+        callBtn.setEnabled(!value);
         connectBtn.setEnabled(!value);
     }
 
@@ -611,7 +558,7 @@ public final class ChatWindow extends JFrame {
     }
 
     private void append(String text, Color color, boolean bold) {
-        StyledDocument doc = chatPane.getStyledDocument();
+        StyledDocument doc = logPane.getStyledDocument();
         SimpleAttributeSet attrs = new SimpleAttributeSet();
         StyleConstants.setForeground(attrs, color);
         StyleConstants.setBold(attrs, bold);
@@ -620,7 +567,34 @@ public final class ChatWindow extends JFrame {
         } catch (BadLocationException ignored) {
             return;
         }
-        chatPane.setCaretPosition(doc.getLength());
+        logPane.setCaretPosition(doc.getLength());
+    }
+
+    /** 结果按缩进 JSON 贴进记录区，和人读的一行摘要区分开。 */
+    private static String pretty(JsonNode node) {
+        String text;
+        try {
+            text = JSON.writerWithDefaultPrettyPrinter().writeValueAsString(node);
+        } catch (Exception e) {
+            text = String.valueOf(node);
+        }
+        StringBuilder sb = new StringBuilder();
+        for (String line : text.split("\n", -1)) {
+            sb.append("  ").append(line).append('\n');
+        }
+        return sb.toString();
+    }
+
+    private static Map<String, Object> parseArgs(String raw) throws IOException {
+        String text = raw == null ? "" : raw.trim();
+        if (text.isEmpty()) {
+            return Map.of();
+        }
+        if (!text.startsWith("{")) {
+            throw new IllegalArgumentException("参数必须是 JSON 对象，当前是: " + text);
+        }
+        return JSON.readValue(text, JSON.getTypeFactory()
+                .constructMapType(LinkedHashMap.class, String.class, Object.class));
     }
 
     private static Throwable unwrap(Exception e) {
@@ -638,7 +612,7 @@ public final class ChatWindow extends JFrame {
         Map<String, String> opts = parseOptions(args);
         if (opts.containsKey("help")) {
             System.out.println("用法: java -jar client.jar [--host=192.168.0.31] [--port=18080]"
-                    + " [--session=win] [--selftest] [--message=一句话]");
+                    + " [--selftest] [--tool=detect] [--args='{\"max_n\":20}']");
             return;
         }
         ClientConfig config = ClientConfig.load();
@@ -655,12 +629,9 @@ public final class ChatWindow extends JFrame {
                 // 保持配置文件里的值
             }
         }
-        if (opts.containsKey("session")) {
-            config.session(opts.get("session"));
-        }
 
         if (opts.containsKey("selftest")) {
-            System.exit(selftest(config, opts.get("message")));
+            System.exit(selftest(config, opts.get("tool"), opts.getOrDefault("args", "")));
         }
 
         try {
@@ -678,9 +649,9 @@ public final class ChatWindow extends JFrame {
     }
 
     /**
-     * 明细区要用等宽字体，但必须能显示中文。
+     * 记录区要用等宽字体，但必须能显示中文。
      *
-     * <p>Consolas 这类西文等宽字体没有中文字形，Windows 上会画成方块（工具返回里的中文全废）。
+     * <p>Consolas 这类西文等宽字体没有中文字形，Windows 上会画成方块（识别结果里的中文全废）。
      * 逻辑字体 {@code Monospaced}/{@code SansSerif} 由 JDK 组合出中文回退，物理字体没有，
      * 所以这里按「系统真装了 + 确实能显示中文」两个条件挑，都没有才退回逻辑等宽字体。
      */
@@ -692,7 +663,7 @@ public final class ChatWindow extends JFrame {
         for (String name : preferred) {
             Font candidate = new Font(name, Font.PLAIN, size);
             // 字体不存在时 Java 静默换成 Dialog，getFamily() 就不再是原名，借此排除
-            if (candidate.getFamily().equalsIgnoreCase(name) && candidate.canDisplayUpTo("工具调用") < 0) {
+            if (candidate.getFamily().equalsIgnoreCase(name) && candidate.canDisplayUpTo("识别工具") < 0) {
                 return candidate;
             }
         }
@@ -700,9 +671,9 @@ public final class ChatWindow extends JFrame {
     }
 
     /** 无界面自检：只验证配置解析 + 连通性，方便在服务器/CI 上排障。 */
-    private static int selftest(ClientConfig config, String message) {
+    private static int selftest(ClientConfig config, String tool, String args) {
         System.out.println("[selftest] " + config);
-        System.out.println("[selftest] 明细字体=" + monoFont(12).getFamily());
+        System.out.println("[selftest] 记录字体=" + monoFont(12).getFamily());
         HostClient host = new HostClient(config.baseUrl());
         try {
             JsonNode tools = host.tools();
@@ -713,11 +684,10 @@ public final class ChatWindow extends JFrame {
                 // 窗口没开也会走到这里，不影响自检结论
                 System.out.println("[selftest] 抓帧不可用：" + HostClient.rootMessage(e));
             }
-            if (message != null && !message.isBlank()) {
-                JsonNode out = host.chat(config.session(), message, config.vision());
-                System.out.println("[selftest] ok=" + out.path("ok").asBoolean(false)
-                        + " steps=" + out.path("steps").size()
-                        + " reply=" + HostClient.oneLine(out.path("reply").asText(""), 200));
+            if (tool != null && !tool.isBlank()) {
+                JsonNode out = host.invoke(tool, parseArgs(args));
+                System.out.println("[selftest] " + tool + " ok=" + out.path("ok").asBoolean(false)
+                        + " " + HostClient.oneLine(out.toString(), 300));
             }
             return 0;
         } catch (Exception e) {
