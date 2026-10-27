@@ -10,6 +10,8 @@
   · stdio（默认）：`python -m game_mcp.server`，由 Java client 作为子进程拉起；
   · streamable-http：常驻监听，供容器里的 host 通过 AUTOGAME_MCP_URL 连接。
     因为要操作 macOS 本机窗口，这个进程只能跑在宿主机，不能放进 Linux 容器。
+    同一个 HTTP 服务上还挂了一个 GET /frame.jpg：当前画面快照，给人看（客户端「卡住时
+    看一眼」），不进工具清单、不发给模型。
 """
 from __future__ import annotations
 
@@ -514,6 +516,8 @@ TRANSPORT = os.getenv("AUTOGAME_MCP_TRANSPORT", "stdio").strip().lower()
 HTTP_HOST = os.getenv("AUTOGAME_MCP_HOST", "0.0.0.0").strip()
 HTTP_PORT = int(os.getenv("AUTOGAME_MCP_PORT", "18090"))
 HTTP_PATH = os.getenv("AUTOGAME_MCP_PATH", "/mcp").strip()
+# 抓帧端点挂在同一个 HTTP 服务上（与 MCP 端点同级，host 由 AUTOGAME_MCP_URL 推导出地址）
+FRAME_PATH = "/frame.jpg"
 # SDK 默认只放行 localhost 的 Host 头，容器经 host.docker.internal 访问会被 421 拒绝，
 # 所以这里显式列出允许的 Host（逗号分隔，形如 host:port，port 可写 *）。
 HTTP_ALLOWED_HOSTS = [h.strip() for h in os.getenv(
@@ -521,12 +525,55 @@ HTTP_ALLOWED_HOSTS = [h.strip() for h in os.getenv(
     "127.0.0.1:*,localhost:*,[::1]:*,host.docker.internal:*").split(",") if h.strip()]
 
 
+# ---------- 抓帧端点：给人看，不给模型看 ----------
+_FRAME_QUALITY = 80
+
+
+def _grab_jpeg() -> bytes:
+    """抓一帧并编码成 JPEG；由 frame_jpg 丢进 worker 线程跑（screencapture 是阻塞的）。"""
+    import cv2
+
+    img = _make_ctx().grab()
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), _FRAME_QUALITY])
+    if not ok:
+        raise RuntimeError("JPEG 编码失败")
+    return buf.tobytes()
+
+
+@app.custom_route(FRAME_PATH, methods=["GET"])
+async def frame_jpg(request):
+    """当前游戏画面快照（JPEG），客户端「等太久/疑似卡住」时看一眼用的。
+
+    刻意不注册成 MCP 工具：它不参与决策，也不该出现在模型看到的工具清单里——
+    约定一直是只把识别清单发给模型，不发截图。这里同理，是给人看的调试窗口。
+
+    走独立线程、不抢 _WRITE_LOCK，所以单步推进正卡在大模型调用上时照样出图；
+    也不落盘（debug/ 只在失败样本时才写），每帧都是一次性字节流。
+    """
+    from starlette.concurrency import run_in_threadpool
+    from starlette.responses import Response
+
+    started = time.perf_counter()
+    try:
+        jpeg = await run_in_threadpool(_grab_jpeg)
+    except WindowNotFound as e:
+        return Response(str(e), status_code=503, media_type="text/plain; charset=utf-8")
+    except Exception as e:  # noqa: BLE001 出图失败不该把服务带崩
+        log.warning("抓帧失败 %dms: %s", _ms(started), e)
+        return Response(f"抓帧失败: {type(e).__name__}: {e}", status_code=500,
+                        media_type="text/plain; charset=utf-8")
+    log.debug("抓帧 %d 字节 %dms（客户端 %s）", len(jpeg), _ms(started),
+              getattr(request.client, "host", "?"))
+    return Response(jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
 def _run_streamable_http() -> None:
     """常驻 HTTP：host 跑在容器里时经 host.docker.internal 连进来。"""
     from mcp.server.transport_security import TransportSecuritySettings
 
-    log.info("MCP server 监听 http://%s:%d%s allowed_hosts=%s",
-             HTTP_HOST, HTTP_PORT, HTTP_PATH, HTTP_ALLOWED_HOSTS)
+    log.info("MCP server 监听 http://%s:%d%s allowed_hosts=%s（抓帧 http://%s:%d%s）",
+             HTTP_HOST, HTTP_PORT, HTTP_PATH, HTTP_ALLOWED_HOSTS,
+             HTTP_HOST, HTTP_PORT, FRAME_PATH)
     if HTTP_HOST in ("0.0.0.0", "::"):
         log.warning("MCP server 绑定 %s，同网段可直连；如需只给本机用，设 AUTOGAME_MCP_HOST=127.0.0.1", HTTP_HOST)
     app.run(transport="streamable-http", host=HTTP_HOST, port=HTTP_PORT,

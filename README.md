@@ -20,7 +20,7 @@ autogame/
 │       ├── LlmClient.java         # OpenAI 兼容 /chat/completions
 │       ├── AiChatService.java     # 对话循环：决策 -> 调 MCP 工具 -> 复述结果
 │       ├── DecisionLog.java       # 模型判断日志（项目根 ai-decisions.log）
-│       └── ChatApi.java           # AI 服务接口：/ai/chat|tools|history|reset
+│       └── ChatApi.java           # AI 服务接口：/ai/chat|tools|frame|history|reset
 ├── mcpclient/               # MCP 客户端层（官方 MCP Java SDK）
 │   ├── packaging/                 # Windows 客户端启动脚本与包内说明
 │   └── src/main/java/com/autogame/client/
@@ -317,6 +317,7 @@ bash scripts/docker-host.sh       # 终端 B：构建并启动 host 容器，对
 bash scripts/docker-host.sh logs  # 出现「mcpserver 已就绪」即握手成功
 bash scripts/docker-host.sh restart  # 改了 host/config.json（换模型、换 key）后必须重启
 curl -s localhost:18080/ai/tools  # 应返回 count=17（17 个工具）
+curl -s localhost:18080/ai/frame -o /tmp/frame.jpg  # 当前画面快照（给眼睛看，不给模型）
 ```
 
 `host/config.json` 是挂载进容器的（`./:/app`），进程只在启动时读一次：只跑 `up` 不会重启
@@ -380,8 +381,8 @@ autogame-client-win-x64/
 ```
 
 用法：解压 → 双击 `start-client.bat` → 顶部「服务 IP / 端口」填 host 的地址点「连接」
-（成功后状态栏显示「已连接 … 工具 15 个」）→ 输入框打字，按「发送」或 `Ctrl+Enter`。
-上方是对话，下方是这一轮 AI 调用了哪些工具、参数、耗时、返回。
+（成功后状态栏显示「已连接 … 工具 17 个」）→ 输入框打字，按「发送」或 `Ctrl+Enter`。
+上方是对话，下方是这一轮 AI 调用了哪些工具、参数、耗时、返回，右侧是当前画面。
 
 - 地址填一次就存进同目录 `client.properties`，下次自动带出；也可直接把
   `http://192.168.0.31:18080` 粘进「服务 IP」，端口会自动拆出来。
@@ -395,6 +396,22 @@ runtime\bin\java.exe -jar client.jar --selftest --base=http://192.168.0.31:18080
 
 命令行参数：`--host` / `--port` / `--base` / `--session` / `--vision`。
 
+### 右侧「当前画面」
+
+不按秒轮询（每秒抓帧会把宿主机的取图拖满）：平时想看就点「看当前画面」；
+只有本轮以「绕圈/卡住」收场时客户端才自动补一帧，标题下带上标签，
+如「绕圈 · 10:41:02 788×619 · 99KB」。它解决的是「等太久，像卡住了但不知道卡在哪一步」。
+
+- 链路是 `client -> host /ai/frame -> mcpserver /frame.jpg`，**不经过** `GameService` 的
+  `synchronized`，也不抢 mcpserver 的写锁，所以正在跑的那一步不被迫排队；
+- 抓帧**不落盘**（`debug/` 只写失败样本），也**不进工具清单**：约定一直是只把识别清单发给
+  模型、不发截图，这块面板同理只给人看；
+- 抓帧失败（游戏没开、窗口不在、stdio 模式没有该端点）时，标题下那行小字会给出原因，
+  自动那一帧不会往对话区刷屏；手动点才会把错误写进对话区。
+- 「绕圈/卡住」的判定在客户端侧：step 的返回里带「绕圈」（mcpserver 的画面指纹），
+  或本轮 `ok=false` 且收尾文案含「疑似卡住 / 没有产生任何动作 / 同一操作重复 / 轮数已达上限」（host 的硬限制）。
+- `--selftest` 会额外打印一帧的大小（KB），用来快速判断宿主机侧的截图权限与窗口状态。
+
 macOS 侧仍可用终端版对话框：`bash scripts/run-chat.sh`（`chat.jar`，同样支持 `--base`）。
 
 ## 7. 说明与约定
@@ -402,6 +419,8 @@ macOS 侧仍可用终端版对话框：`bash scripts/run-chat.sh`（`chat.jar`�
 - **工具清单（17）**：`ping`、`list_windows`、`capture`、`ocr`、`layout`、`detect`、`click_point`、
   `click_text`、`press_key`、`advise`、`open_game`、`close_game`、`game_status`、`login`、
   `back_to_main`、`daily_task`、`market_scan`。
+- **画面快照只有人看**：`mcpserver` 的 `GET /frame.jpg` 与 `host` 的 `GET /ai/frame` 专供客户端
+  右侧面板，不是工具，不会出现在工具清单里，也不会发给模型；抓帧不抢写锁、不落盘。
 - **工具描述就是提示词**：每个工具的使用场景、触发说法、是否真实操作、返回字段都写在
   `mcpserver/game_mcp/server.py` 的 docstring 里（MCP 会把它当 description 透给模型）；
   host 的 `SYSTEM_PROMPT` 只保留对话协议（JSON 格式、tool/reply 二选一、失败两次停手），
@@ -574,6 +593,7 @@ bash scripts/check.sh
 |---|---|
 | `test_vision_gate` | 弹窗帧要检出顶层面板、主场景不能检出；遮罩下的按钮不进候选且带「（遮罩下·点不动）」；面板内彩色选项进候选；UITag 的 icon 大框不得把三条任务行合成一个候选；画面指纹同图同值异图异值 |
 | `test_step_once` | 单步只发一组动作（不自己循环）、过程字段齐全、窗口不在前台时 `executed=0` 且有原因、`done` 清空状态、绕圈记录跨调用保留 |
+| `test_frame_route` | 抓帧端点返回客户端能解码的 JPEG（尺寸与源帧一致）；无窗口时 `503` + 人话；不进 MCP 工具清单 |
 | `test_collect_dedupe` | 同画面多帧只存 1 张、不同画面照存、重启后从 `index.jsonl` 恢复基线不重存 |
 | `test_input_guard` | 窗口不在前台时 `click`/`drag`/`hotkey`/`type_text`/`press_key` 一个事件都不发 |
 | `test_tool_guard` | 写操作并发回 `busy=true`、锁可重入、dict 工具异常转 `ok=false`、关键词与节奏以 config 为准 |

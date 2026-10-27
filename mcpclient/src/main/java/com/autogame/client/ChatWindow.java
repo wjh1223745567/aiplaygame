@@ -2,6 +2,8 @@ package com.autogame.client;
 
 import com.fasterxml.jackson.databind.JsonNode;
 
+import javax.imageio.ImageIO;
+import javax.swing.ImageIcon;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
 import javax.swing.JFrame;
@@ -13,6 +15,7 @@ import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.JTextPane;
 import javax.swing.KeyStroke;
+import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
 import javax.swing.SwingWorker;
 import javax.swing.UIManager;
@@ -26,10 +29,19 @@ import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
+import java.awt.Graphics2D;
 import java.awt.GridLayout;
+import java.awt.RenderingHints;
 import java.awt.event.ActionEvent;
+import java.awt.event.ComponentAdapter;
+import java.awt.event.ComponentEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
@@ -39,6 +51,10 @@ import java.util.concurrent.ExecutionException;
  *
  * <p>和 {@link ChatConsole} 一样只做「发一句话、看 AI 调了哪些工具」，决策与工具执行都在
  * host / mcpserver 侧。地址、会话、截图开关会写进 client.properties，下次打开自动带出。
+ *
+ * <p>右侧是当前画面快照（host 的 {@code /ai/frame}）：不按秒轮询，只有手动点「看当前画面」、
+ * 或本轮以「绕圈/卡住」收场时才抓一帧。这一步走的是独立 HTTP，不等候正在执行的那一步，
+ * 所以“看着像卡住了”的时候至少能看到游戏停在哪里。
  *
  * <pre>
  * java -jar client.jar                        # 读 client.properties，默认 192.168.0.31:18080
@@ -53,6 +69,12 @@ public final class ChatWindow extends JFrame {
     private static final Color AI = new Color(0x146C43);
     private static final Color ERROR = new Color(0xB42318);
     private static final Color MUTED = new Color(0x6E7781);
+    private static final Color VIDEO_BG = new Color(0x0D1117);
+    /** 收尾文案里出现这些字样就算「绕圈/卡住」：只有这种结局才自动抓一帧，其余等用户动手。 */
+    private static final String[] STUCK_HINTS = {
+            "疑似卡住", "没有产生任何动作", "轮数已达上限", "同一操作重复"
+    };
+    private static final DateTimeFormatter CLOCK = DateTimeFormatter.ofPattern("HH:mm:ss");
 
     private final ClientConfig config;
     private final JTextField hostField;
@@ -64,10 +86,19 @@ public final class ChatWindow extends JFrame {
     private final JTextArea inputArea = new JTextArea(3, 60);
     private final JCheckBox visionCheck;
     private final JButton sendBtn = new JButton("发送 (Ctrl+Enter)");
-    private final JButton connectBtn = new JButton("连接");
+    private final JButton connectBtn = new JButton("连 接");
+    private final JLabel frameLabel = new JLabel("连上 host 后可见当前画面", SwingConstants.CENTER);
+    private final JLabel frameHint = new JLabel("点「看当前画面」抓一帧（卡住时自动抓一次）");
+    private final JButton frameBtn = new JButton("看当前画面");
 
     private HostClient client;
     private boolean busy;
+    /** 上一个抓帧请求还没回来（抓帧不能叠着发，否则宿主机排队越堆越长）。 */
+    private boolean frameFetching;
+    /** 最近一帧原图：窗口缩放时用它重缩放，不重新请求。 */
+    private BufferedImage frameImage;
+    /** 左右分栏，窗口出来后把分隔条摆到中间靠右。 */
+    private JSplitPane mainSplit;
 
     public ChatWindow(ClientConfig config) {
         super("Autogame 客户端");
@@ -143,7 +174,47 @@ public final class ChatWindow extends JFrame {
         JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, chatScroll, tracePanel);
         split.setResizeWeight(0.72);
         split.setDividerSize(6);
-        return split;
+
+        mainSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, split, buildFramePanel());
+        mainSplit.setResizeWeight(0.74);
+        mainSplit.setDividerSize(6);
+        return mainSplit;
+    }
+
+    /** 右侧画面面板：一眼看到游戏现在停在哪。只给人看，不参与任何决策。 */
+    private JPanel buildFramePanel() {
+        frameLabel.setOpaque(true);
+        frameLabel.setBackground(VIDEO_BG);
+        frameLabel.setForeground(MUTED);
+        // 面板尺寸变化时用原图重缩放，而不是把拉伸后的那张再拉一次
+        frameLabel.addComponentListener(new ComponentAdapter() {
+            @Override
+            public void componentResized(ComponentEvent e) {
+                renderFrame();
+            }
+        });
+
+        JPanel head = new JPanel(new BorderLayout());
+        head.add(new JLabel("当前画面"), BorderLayout.WEST);
+
+        // 时间/分辨率单独占一行：和中英文混排的按钮挤在一行时会被截成「…」
+        frameHint.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 11));
+        frameHint.setForeground(MUTED);
+        JPanel buttonRow = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+        buttonRow.add(frameBtn);
+        frameBtn.addActionListener(e -> refreshFrame(false));
+
+        JPanel foot = new JPanel(new BorderLayout(0, 4));
+        foot.add(frameHint, BorderLayout.NORTH);
+        foot.add(buttonRow, BorderLayout.SOUTH);
+
+        JPanel panel = new JPanel(new BorderLayout(0, 4));
+        panel.add(head, BorderLayout.NORTH);
+        panel.add(frameLabel, BorderLayout.CENTER);
+        panel.add(foot, BorderLayout.SOUTH);
+        panel.setPreferredSize(new Dimension(340, 0));
+        panel.setMinimumSize(new Dimension(240, 0));
+        return panel;
     }
 
     private JPanel buildInputBar() {
@@ -215,6 +286,7 @@ public final class ChatWindow extends JFrame {
                     int count = out.path("count").asInt(0);
                     setStatus("已连接 " + base + " · 工具 " + count + " 个", AI);
                     append("[已连接] " + base + "，可用工具 " + count + " 个。\n\n", MUTED, false);
+                    refreshFrame(true);
                 } catch (Exception e) {
                     client = null;
                     Throwable cause = unwrap(e);
@@ -260,7 +332,13 @@ public final class ChatWindow extends JFrame {
             protected void done() {
                 setBusy(false);
                 try {
-                    renderReply(get());
+                    JsonNode out = get();
+                    // 平时不自动抓帧：只有这一轮以「绕圈/卡住」收场时才补一张，看它停在哪
+                    String stuck = stuckReason(out);
+                    if (!stuck.isEmpty()) {
+                        refreshFrame(true, stuck);
+                    }
+                    renderReply(out);
                 } catch (Exception e) {
                     append("[失败] " + HostClient.rootMessage(unwrap(e)) + "\n\n", ERROR, false);
                     traceArea.append("—— 本轮失败" + System.lineSeparator());
@@ -298,6 +376,128 @@ public final class ChatWindow extends JFrame {
         } else {
             append("AI(未完成)> " + reply + "\n\n", ERROR, false);
         }
+    }
+
+    // ---------- 画面 ----------
+
+    /**
+     * 本轮是不是「绕圈/卡住」收场：是的话返回一个短标签，否则空串。
+     *
+     * <p>两条来源：mcpserver 侧的画面指纹绕圈（写在 step 的 result 里），和 host 侧的硬限制
+     * （连续几步无动作 / 同一操作重复 / 轮数用完）。这些结局最需要一张图——看它到底停在哪。
+     */
+    private static String stuckReason(JsonNode out) {
+        for (JsonNode step : out.path("steps")) {
+            if (step.path("result").asText("").contains("绕圈")) {
+                return "绕圈";
+            }
+        }
+        if (out.path("ok").asBoolean(true)) {
+            return "";
+        }
+        String reply = out.path("reply").asText("");
+        for (String hint : STUCK_HINTS) {
+            if (reply.contains(hint)) {
+                return "疑似卡住";
+            }
+        }
+        return "";
+    }
+
+    /** 手动/连接时抓一帧（没有额外标签）。 */
+    private void refreshFrame(boolean silent) {
+        refreshFrame(silent, "");
+    }
+
+    /**
+     * 拉一帧贴到右侧。
+     *
+     * <p>silent=true 是不带错误刷屏的抓帧：失败只更新画面标题下那行小字
+     * ——抓帧失败往往就是窗口没了/游戏关了，用户此刻在意的不是这个。
+     *
+     * <p>note 非空时写进标题下的小字（如「疑似卡住」），用来区分这张图是怎么来的。
+     *
+     * <p>走的是 host 的 /ai/frame，与发消息的那条请求互不影响，所以一轮对话跑着的时候一样能刷。
+     */
+    private void refreshFrame(boolean silent, String note) {
+        HostClient target = client;
+        if (target == null) {
+            if (!silent) {
+                append("[提示] 还没连上 host，先点「连接」。\n\n", ERROR, false);
+            }
+            return;
+        }
+        if (frameFetching) {
+            return;
+        }
+        frameFetching = true;
+        frameHint.setText(stamp() + " 抓取中…" + (note.isEmpty() ? "" : "（" + note + "）"));
+        new SwingWorker<byte[], Void>() {
+            @Override
+            protected byte[] doInBackground() throws Exception {
+                return target.frame();
+            }
+
+            @Override
+            protected void done() {
+                frameFetching = false;
+                try {
+                    showFrame(get(), note);
+                } catch (Exception e) {
+                    String message = HostClient.rootMessage(unwrap(e));
+                    frameHint.setText(stamp() + " 抓帧失败：" + HostClient.oneLine(message, 30));
+                    frameHint.setToolTipText(message);
+                    if (!silent) {
+                        append("[抓帧失败] " + message + "\n\n", ERROR, false);
+                    }
+                }
+            }
+        }.execute();
+    }
+
+    private void showFrame(byte[] jpeg, String note) throws IOException {
+        BufferedImage image = ImageIO.read(new ByteArrayInputStream(jpeg));
+        if (image == null) {
+            throw new IOException("返回内容不是 JPEG（" + jpeg.length + " 字节）");
+        }
+        frameImage = image;
+        renderFrame();
+        // 标签放最前：面板窄，放末尾会被截成「…」，而这张图怎么来的比分辨率重要
+        String text = (note.isEmpty() ? "" : note + " · ") + stamp() + " "
+                + image.getWidth() + "×" + image.getHeight()
+                + " · " + Math.max(1, jpeg.length / 1024) + "KB";
+        frameHint.setText(text);
+        frameHint.setToolTipText(text);
+    }
+
+    /** 按面板当前尺寸等比缩放；每次都从原图重画，避免多轮缩放糊掉。 */
+    private void renderFrame() {
+        BufferedImage source = frameImage;
+        if (source == null) {
+            return;
+        }
+        int maxWidth = Math.max(80, frameLabel.getWidth() - 4);
+        int maxHeight = Math.max(80, frameLabel.getHeight() - 4);
+        double scale = Math.min(maxWidth / (double) source.getWidth(),
+                maxHeight / (double) source.getHeight());
+        int width = Math.max(1, (int) Math.round(source.getWidth() * scale));
+        int height = Math.max(1, (int) Math.round(source.getHeight() * scale));
+
+        BufferedImage scaled = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = scaled.createGraphics();
+        try {
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
+                    RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            g.drawImage(source, 0, 0, width, height, null);
+        } finally {
+            g.dispose();
+        }
+        frameLabel.setText(null);
+        frameLabel.setIcon(new ImageIcon(scaled));
+    }
+
+    private static String stamp() {
+        return LocalTime.now().format(CLOCK);
     }
 
     private void showTools() {
@@ -471,6 +671,8 @@ public final class ChatWindow extends JFrame {
         SwingUtilities.invokeLater(() -> {
             ChatWindow window = new ChatWindow(config);
             window.setVisible(true);
+            // 分隔条按比例落位：这时面板已有真实尺寸，不会被 preferred size 顶偏
+            window.mainSplit.setDividerLocation(0.72);
             window.autoConnect();
         });
     }
@@ -505,6 +707,12 @@ public final class ChatWindow extends JFrame {
         try {
             JsonNode tools = host.tools();
             System.out.println("[selftest] 工具 " + tools.path("count").asInt(0) + " 个");
+            try {
+                System.out.println("[selftest] 抓帧 " + (host.frame().length / 1024) + "KB");
+            } catch (Exception e) {
+                // 窗口没开也会走到这里，不影响自检结论
+                System.out.println("[selftest] 抓帧不可用：" + HostClient.rootMessage(e));
+            }
             if (message != null && !message.isBlank()) {
                 JsonNode out = host.chat(config.session(), message, config.vision());
                 System.out.println("[selftest] ok=" + out.path("ok").asBoolean(false)
