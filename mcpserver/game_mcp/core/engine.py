@@ -120,8 +120,9 @@ class BotContext:
         return None
 
     # ---------- 行动 ----------
-    def click_point(self, px: float, py: float, **kw) -> None:
-        self.input.click(px, py, **kw)
+    def click_point(self, px: float, py: float, **kw) -> bool:
+        """点像素坐标；返回是否真的发出（窗口不在前台时为 False，不会误点到其他应用）。"""
+        return self.input.click(px, py, **kw)
 
     def click_text(self, keyword: str, img: Optional[np.ndarray] = None,
                    region=None, timeout: float = 10.0) -> bool:
@@ -135,5 +136,4 @@ class BotContext:
             _log.debug("未找到文字 %r，放弃点击", keyword)
             return False
         _log.info("点击文字 %r (%d,%d)", keyword, hit.cx, hit.cy)
-        self.input.click(hit.cx, hit.cy)
-        return True
+        return self.input.click(hit.cx, hit.cy)

@@ -471,7 +471,7 @@ macOS 侧仍可用终端版对话框：`bash scripts/run-chat.sh`（`chat.jar`�
 - **按钮权重微调（失败案例驱动）**：模板管固定 HUD，动态界面（商城/背包/对话框/文案变化的
   列表行）靠模型补；现用的 UITag 权重在本游戏上召回低（实测主页面 0 个 Button），所以留了一条
   自训练通道——「可点候选为空」的画面就是当前识别链的盲区，自动存下来当训练数据。
-  1. **采集（自动）**：`daily_task` 循环里 `build_candidates` 返回空 → 画面存入
+  1. **采集（自动）**：`daily_task` 单步里 `build_candidates` 返回空 → 画面存入
      `debug/failed_shots/<时间戳>_<指纹8位>.png`，并追加 `index.jsonl`（ts/goal/区域数/
      文字数/screen_key/路径）。去重用图像感知哈希：8x8 均值哈希 + 汉明距离 ≤ 12 算同一画面（实测同画面
      帧间距离 0-6、不同画面 13-24），同一画面只存一张；不用区域文本集合当键——聊天频道一直在滚，
@@ -490,6 +490,24 @@ macOS 侧仍可用终端版对话框：`bash scripts/run-chat.sh`（`chat.jar`�
      回退就是改回 `yolo-ui.pt`（原文件保留），真机用 `layout` 看 `source=yolo kind=button` 数量。
   数据集 `datasets/ui/`：`images/` 与 `runs/` 已 gitignore（可由 failed_shots 重建），
   `data.yaml` / `labels/` / `proposals.json` 入库保住筛选成果。
+- **单步推进，循环在 host**：`daily_task` / `market_scan` 一次调用只走一步（识别一帧 → 视觉模型选一步 →
+  我方坐标执行），返回值里带着 `scene` / `reason` / `chosen` / `executed` / `done` / `note`，
+  下一步由 host 的轮数上限驱动。以前是工具内部自己转 120 步、只回一个 `steps` 数字，
+  外层模型看不到过程、无法纠偏，两个大脑各算各的。现在只有一个大脑：外层模型看过程下指令，内层只负责单步。
+  绕圈记录（哪一步会导致绕回旧画面）从局部变量提到模块级（`vision/llm._STEP_STATE`），跨调用保留；
+  参数重复不再算「卡住」，host 改看 `executed`：连续 3 步没有动作才停下。
+- **前台不过就不动手**：鼠标与键盘事件是全局的，窗口没切到前台时发出去会打到用户正在用的别的应用上，
+  对游戏本身也毫无作用（空转的帮凶）。`click` / `drag` / `press_key` / `hotkey` / `type_text` 一律先试着切前台，
+  切不过去就记 warning 并返回 False，一个事件都不发；`click_point` / `click_text` 据此回 `ok=false`，
+  决策循环也不再把它算作「已执行」。
+- **写操作串行**：工具共用唯一的一套鼠标键盘，`click_point` / `click_text` / `press_key` / `open_game` /
+  `close_game` / `login` / `back_to_main` / `daily_task` / `market_scan` 走同一把可重入锁。一次单步跑着的时候
+  另一路调用会立刻拿到 `busy=true`（不排队：单步要等一轮视觉模型，排队的短工具只能表现成卡死）。
+  只读工具（`ocr` / `layout` / `detect` / `advise`）不受影响。
+- **异常兜底**：工具抛异常时，返回注解是 `dict` 的统一转成 `{ok:false, error:"<工具> 异常: ..."}`（模型看得懂
+  下一步该干什么），返回 `str` / `list` 的工具没法塞 dict，仍原样抛给 MCP。
+- **画面没变就不重算**：决策循环每步先算一次 32x32 均值指纹（~3ms），与上帧一致就直接复用上帧区域，
+  省掉整图 OCR（≈1.3s）与模板/YOLO 融合（≈1.3s）——点了没反应时画面纹丝不动，这两笔钱本来每轮白付。
 - **人工接管即暂停**：鼠标被**人**移动或点击后，自动化立刻停手（不点击/不按键/不移动，也不推进流程），
   鼠标静止满 `human_guard.idle_resume_sec`（默认 10s）自动恢复。程序自身的移动/点击由
   `program_action()` 计数 + `program_grace_sec`（0.6s）宽限期滤掉，不会自己触发自己。
@@ -522,8 +540,11 @@ macOS 侧仍可用终端版对话框：`bash scripts/run-chat.sh`（`chat.jar`�
 - **onnxruntime 钉版本**：1.21.1 是 macOS 13.0 上可用的最后一版（1.23+ 的 wheel 按 13.4 构建会缺 libc++ 符号）。
 - **配置分两份**（均在各自模块下，模板见同目录 `config.example.json`）：
   - `host/config.json`：`llm` 段（api_base / api_key / model / 超时 / 轮数 / 附图）；含密钥，已 gitignore。
-  - `mcpserver/config.json`：`window` / `capture` / `input` / `human_guard` / `timing` / `ocr` /
-    `template` / `vision` / `yolo`。
+  - `mcpserver/config.json`：`window` / `capture` / `input` / `human_guard` / `timing` / `keywords` / `ocr` /
+    `template` / `vision` / `yolo`。`timing` 管全部等待（`step_pause` / `click_pause` / `idle_pause` /
+    `back_step_wait` / `enter_click_wait` / `dialog_click_pause` / `dialog_retry_pause` /
+    `loading_poll_pause` / `advance_poll_pause` / `window_poll_pause`），`keywords` 管登录/关闭/弹窗/战斗/
+    主场景这些文案表；两段都没配时回落到 `tools/game.py` 里的默认值，改文案或调节奏不必改代码。
 
   Python 侧 `config.py` 读游戏配置时会自动把 `host/config.json` 的 `llm` 段合并进来，
   所以 `Advisor(cfg)` 等读 `cfg["llm"]` 的代码不变；密钥只存一处。可用环境变量覆盖：
@@ -531,3 +552,26 @@ macOS 侧仍可用终端版对话框：`bash scripts/run-chat.sh`（`chat.jar`�
 - **旧版单进程实现已移除**：原 `mhxy_bot/`、`mhxy`、`start.command`、根 `requirements.txt` 与 3.9 版 `venv/`
   已删除，全部能力收敛到 `mcpserver/game_mcp/`；`assets/`、`debug/` 仍留在项目根，
   由 `mcpserver` 相对项目根引用。
+
+## 8. 回归用例（离线）
+
+`mcpserver/tests/` 是入库的回归用例：跑真代码路径、用 `tests/fixtures/` 里的固定截图，不需要游戏在跑。
+
+```bash
+# 有过 pytest 就用它（输出更细）；没有也能跑，两条路径是同一批用例
+mcpserver/.venv/bin/python -m pytest -q mcpserver/tests
+mcpserver/.venv/bin/python mcpserver/tests/run.py
+
+# 一把梭：语法检查 + 全部用例
+bash scripts/check.sh
+```
+
+| 用例 | 钉住的行为 |
+|---|---|
+| `test_vision_gate` | 弹窗帧要检出顶层面板、主场景不能检出；遮罩下的按钮不进候选且带「（遮罩下·点不动）」；面板内彩色选项进候选；画面指纹同图同值异图异值 |
+| `test_step_once` | 单步只发一组动作（不自己循环）、过程字段齐全、窗口不在前台时 `executed=0` 且有原因、`done` 清空状态、绕圈记录跨调用保留 |
+| `test_collect_dedupe` | 同画面多帧只存 1 张、不同画面照存、重启后从 `index.jsonl` 恢复基线不重存 |
+| `test_input_guard` | 窗口不在前台时 `click`/`drag`/`hotkey`/`type_text`/`press_key` 一个事件都不发 |
+| `test_tool_guard` | 写操作并发回 `busy=true`、锁可重入、dict 工具异常转 `ok=false`、关键词与节奏以 config 为准 |
+
+样例帧在 `tests/fixtures/*.png`（约 2.8MB）。换样例帧就等于换基线，改之前先跑一遍确认现在是绿的。

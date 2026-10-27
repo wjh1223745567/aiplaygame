@@ -104,16 +104,21 @@ class InputController:
         self._mouse.position = (gx, gy)
 
     def click(self, px: float, py: float, button: str = "left",
-              double: bool = False, move_first: bool = True) -> None:
+              double: bool = False, move_first: bool = True) -> bool:
+        """点一下游戏窗口内的像素坐标；返回是否真的发出了点击。"""
         if is_stopped():
-            return
+            return False
         if is_dry_run():
             _log.info("dry-run 点击 (%d,%d) %s", px, py, button)
-            return
+            return True
         if not get_guard().wait_if_paused():
-            return
-        # 前台切换不产生鼠标事件，放在 program_action 之外，免得白白扩大宽限期
-        self._ensure_front()
+            return False
+        # 前台切换不产生鼠标事件，放在 program_action 之外，免得白白扩大宽限期。
+        # 鼠标事件是全局坐标：窗口没到前台时这一击会落到用户正在用的应用上，
+        # 而且对游戏毫无作用（空转的帮凶），所以和 press_key 一样必须拦下来。
+        if not self._ensure_front():
+            _log.warning("点击 (%d,%d) 未发送：游戏窗口不在前台，避免点到其他应用", px, py)
+            return False
         jx = px + random.uniform(-self.offset, self.offset)
         jy = py + random.uniform(-self.offset, self.offset)
         with get_guard().program_action():
@@ -122,15 +127,20 @@ class InputController:
             btn = MouseButton.left if button == "left" else MouseButton.right
             self._mouse.click(btn, count=2 if double else 1)
         _log.info("点击 (%d,%d) %s%s", px, py, button, " 双击" if double else "")
+        return True
 
-    def drag(self, p1: tuple, p2: tuple) -> None:
+    def drag(self, p1: tuple, p2: tuple) -> bool:
+        """从 p1 拖到 p2；返回是否真的发出了拖拽。"""
         if is_stopped():
-            return
+            return False
         if is_dry_run():
             _log.info("dry-run 拖拽 (%d,%d) -> (%d,%d)", *p1, *p2)
-            return
+            return True
         if not get_guard().wait_if_paused():
-            return
+            return False
+        if not self._ensure_front():
+            _log.warning("拖拽 (%d,%d)->(%d,%d) 未发送：游戏窗口不在前台", *p1, *p2)
+            return False
         with get_guard().program_action():
             self._move_to_raw(*p1)
             self._mouse.press(MouseButton.left)
@@ -141,6 +151,7 @@ class InputController:
             time.sleep(random.uniform(0.05, 0.15))
             self._mouse.release(MouseButton.left)
         _log.info("拖拽 (%d,%d) -> (%d,%d)", *p1, *p2)
+        return True
 
     # ---------- 键盘 ----------
     # 键盘事件不产生鼠标回调，所以只查暂停，不包 program_action：
@@ -167,16 +178,19 @@ class InputController:
         _log.info("按键 %s", key)
         return True
 
-    def hotkey(self, *keys: str) -> None:
-        """组合键，如 hotkey('cmd', 'v')。"""
+    def hotkey(self, *keys: str) -> bool:
+        """组合键，如 hotkey('cmd', 'v')；返回是否真的发出了按键。"""
         if is_stopped():
-            return
+            return False
         if is_dry_run():
             _log.info("dry-run 组合键 %s", "+".join(keys))
-            return
+            return True
         if not get_guard().wait_if_paused():
-            return
-        self._ensure_front()
+            return False
+        # 与 press_key 同理：组合键也是全局的，窗口不在前台时会打到别的应用
+        if not self._ensure_front():
+            _log.warning("组合键 %s 未发送：游戏窗口不在前台", "+".join(keys))
+            return False
         mapped = []
         for key in keys:
             k = key.lower()
@@ -196,20 +210,24 @@ class InputController:
         for k in reversed(mapped):
             controller.release(k)
         _log.info("组合键 %s", "+".join(keys))
+        return True
 
-    def type_text(self, text: str) -> None:
-        """逐字符输入（ASCII 可靠；中文建议先走剪贴板 paste）。"""
+    def type_text(self, text: str) -> bool:
+        """逐字符输入（ASCII 可靠；中文建议先走剪贴板 paste）；返回是否真的输入了。"""
         if is_stopped():
-            return
+            return False
         if is_dry_run():
             _log.info("dry-run 输入 %r", text)
-            return
+            return True
         if not get_guard().wait_if_paused():
-            return
+            return False
+        if not self._ensure_front():
+            _log.warning("输入 %r 未发送：游戏窗口不在前台，避免打到其他应用", text)
+            return False
         controller = self._keyboard()
         for ch in text:
             if is_stopped():
-                return
+                return False
             if ch == "\n":
                 controller.press(kb.Key.enter)
                 controller.release(kb.Key.enter)
@@ -217,6 +235,7 @@ class InputController:
                 controller.type(ch)
             time.sleep(random.uniform(0.03, 0.1))
         self.human_delay()
+        return True
 
     def paste_text(self, text: str) -> None:
         """通过剪贴板粘贴中文文本。"""

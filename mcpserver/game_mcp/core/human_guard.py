@@ -25,7 +25,7 @@
 
 ## generation
 
-每次「进入暂停」和「恢复」各 +1。上层（`vision/llm.run_advisor_loop`）在计算前记一次、
+每次「进入暂停」和「恢复」各 +1。上层（`vision/llm.step_once`）在计算前记一次、
 点击前再比一次：不相等说明中途被人工接管过，暂停前的截图与坐标全部作废，必须重新感知。
 """
 from __future__ import annotations

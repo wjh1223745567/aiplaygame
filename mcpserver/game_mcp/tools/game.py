@@ -63,6 +63,42 @@ CLOSE_TERM_WAIT = 1.5   # SIGTERM 等待
 CLOSE_KILL_WAIT = 2.0   # SIGKILL 后确认进程消失的等待
 CLOSE_POLL = 0.2        # 探活轮询间隔
 
+# ---------- 配置覆盖（config.keywords / config.timing） ----------
+# 上面的文案与节奏都是「换个客户端版本 / 换个任务就要调」的东西：默认值留在代码里
+# 当兜底，实际取值优先 config.json，改文案或改等待时间不必改代码重发。
+_KEYWORD_DEFAULTS = {
+    "login_buttons": LOGIN_BUTTONS,
+    "enter_buttons": ENTER_BUTTONS,
+    "close_buttons": CLOSE_BUTTONS,
+    "dialog_confirm_buttons": DIALOG_CONFIRM_BUTTONS,
+    "dialog_hints": DIALOG_HINTS,
+    "loading_hints": LOADING_HINTS,
+    "battle_hints": BATTLE_HINTS,
+    "main_scene_hints": MAIN_SCENE_HINTS,
+    "main_scene_strong": MAIN_SCENE_STRONG,
+}
+_TIMING_DEFAULTS = {
+    "back_step_wait": BACK_STEP_WAIT,      # 回主界面每步后的观察时间
+    "enter_click_wait": ENTER_CLICK_WAIT,  # 点完进入类按钮后的观察时间
+    "dialog_click_pause": 0.6,             # 点掉弹窗后的观察时间
+    "dialog_retry_pause": 0.8,             # 弹窗关不掉时的重试间隔
+    "loading_poll_pause": 1.0,             # 等服务区组加载的轮询间隔
+    "advance_poll_pause": 1.2,             # 推进主场景的轮询间隔
+    "window_poll_pause": 1.0,              # 等游戏窗口出现的轮询间隔
+}
+
+
+def _kw(cfg: dict | None, name: str) -> list[str]:
+    """关键词表：config.keywords.<name> 优先，缺省回落到代码里的默认值。"""
+    val = ((cfg or {}).get("keywords") or {}).get(name)
+    return list(val) if val else list(_KEYWORD_DEFAULTS[name])
+
+
+def _sec(cfg: dict | None, name: str) -> float:
+    """节奏（秒）：config.timing.<name> 优先，缺省回落到默认值。"""
+    val = ((cfg or {}).get("timing") or {}).get(name)
+    return float(val) if val is not None else float(_TIMING_DEFAULTS[name])
+
 
 def _window(cfg: dict, include_offscreen: bool = False):
     wc = cfg.get("window", {})
@@ -190,7 +226,7 @@ def open_game(cfg: dict, wait_timeout: float = 90.0) -> dict:
             _log.info("open_game: 窗口已出现 %s（耗时 %.1fs）", win, wait - (end - time.time()))
             return {"ok": True, "already_running": running, "launched": not running,
                     "window": str(win)}
-        time.sleep(1.0)
+        time.sleep(_sec(cfg, "window_poll_pause"))
     if hidden is not None:
         _log.warning("open_game: 游戏已开但窗口仍不可见（最小化或在其他桌面）")
         return {"ok": False, "already_running": True,
@@ -308,7 +344,7 @@ def login(cfg: dict, timeout: float = 120.0, auto_open: bool = True,
         return {"ok": False, "stage": "wait_ready", "launched": launched,
                 "dialogs": dialogs,
                 "error": "登录画面未就绪（服务区组仍在加载或未出现「"
-                         + "」「".join(LOGIN_BUTTONS) + "」按钮）"}
+                         + "」「".join(_kw(cfg, "login_buttons")) + "」按钮）"}
 
     # 2) 点击登录按钮
     if not ctx.click_text(button, timeout=5):
@@ -366,13 +402,13 @@ def back_to_main(cfg: dict, max_steps: int = BACK_MAX_STEPS) -> dict:
         # 其余三层（UITag / 通用 / 实体 OCR）的结果在这一步用不上，不必付 8 步 × 2 次推理的代价
         regions = ctx.analyze(img, results, layers=("template",))
         texts = [r.text for r in results]
-        button = _pick_button(CLOSE_BUTTONS, texts, closed.count, DIALOG_MAX_CLICKS)
+        button = _pick_button(_kw(cfg, "close_buttons"), texts, closed.count, DIALOG_MAX_CLICKS)
         hit = BotContext.find_in(results, button) if button else None
         if hit is not None:
             _log.info("back_to_main: 关闭「%s」(%d,%d)（第 %d 步）", button, hit.cx, hit.cy, step)
             ctx.input.click(hit.cx, hit.cy)
             closed.append(button)
-            time.sleep(BACK_STEP_WAIT)
+            time.sleep(_sec(cfg, "back_step_wait"))
             continue
         # 未标定模板时这一步为空，行为与改造前一致；标定后一步命中最准的关闭键
         tpl_point = _template_point(regions, "close_x")
@@ -381,20 +417,20 @@ def back_to_main(cfg: dict, max_steps: int = BACK_MAX_STEPS) -> dict:
                       tpl_point[0], tpl_point[1], step)
             ctx.input.click(tpl_point[0], tpl_point[1])
             tried_points.append(tuple(tpl_point))
-            time.sleep(BACK_STEP_WAIT)
+            time.sleep(_sec(cfg, "back_step_wait"))
             continue
-        if _main_scene_hit(texts):
+        if _main_scene_hit(texts, cfg):
             _log.info("back_to_main: 已回到主界面（关弹窗 %s、ESC %d 次）", closed, esc)
             return {"ok": True, "stage": "main_scene",
                     "already_in_main": not closed and esc == 0,
                     "closed": closed, "esc_presses": esc, "steps": step,
                     "window": str(win)}
-        if _hit(texts, BATTLE_HINTS):
+        if _hit(texts, _kw(cfg, "battle_hints")):
             _log.warning("back_to_main: 当前在战斗界面，不按 ESC（避免逃跑），放弃")
             return {"ok": False, "stage": "battle", "closed": closed, "esc_presses": esc,
                     "error": "当前在战斗界面，未做任何操作；等战斗结束再调"}
-        if _hit(texts, LOADING_HINTS):
-            time.sleep(BACK_STEP_WAIT)
+        if _hit(texts, _kw(cfg, "loading_hints")):
+            time.sleep(_sec(cfg, "back_step_wait"))
             continue
         # 面板（背包/商城/角色）的关闭键是无文字图标：按截图比例点右上角
         point = _panel_close_point(img.shape[1], img.shape[0], tried_points)
@@ -402,14 +438,14 @@ def back_to_main(cfg: dict, max_steps: int = BACK_MAX_STEPS) -> dict:
             _log.info("back_to_main: 点面板右上角关闭 (%d,%d)（第 %d 步）", point[0], point[1], step)
             ctx.input.click(point[0], point[1])
             tried_points.append(point)
-            time.sleep(BACK_STEP_WAIT)
+            time.sleep(_sec(cfg, "back_step_wait"))
             continue
         _log.info("back_to_main: 不在主界面且无可点关闭按钮，按 ESC（第 %d 步）", step)
         if not ctx.input.press_key("esc"):
             return {"ok": False, "stage": "not_frontmost", "closed": closed, "esc_presses": esc,
                     "error": "按键时游戏窗口已不在前台，已停止（避免按键落到其他应用）"}
         esc += 1
-        time.sleep(BACK_STEP_WAIT)
+        time.sleep(_sec(cfg, "back_step_wait"))
     _log.warning("back_to_main: %d 步内未回到主界面（关弹窗 %s、ESC %d 次）", max_steps, closed, esc)
     return {"ok": False, "stage": "max_steps", "closed": closed, "esc_presses": esc,
             "error": f"{max_steps} 步内未回到主界面，可能卡在面板或弹窗，需要人工处理"}
@@ -469,7 +505,7 @@ def _wait_ready(ctx: BotContext, cfg: dict, timeout: float,
         # 一帧只做一次全图 OCR：多层融合复用同一份截图与识别结果
         regions = ctx.analyze(img, results)
         texts = [r.text for r in results]
-        if _has_dialog(texts, regions):
+        if _has_dialog(texts, regions, cfg):
             if _confirm_dialog(ctx, regions, results, texts, dialogs):
                 stuck = 0
             else:
@@ -477,19 +513,19 @@ def _wait_ready(ctx: BotContext, cfg: dict, timeout: float,
                 if stuck >= DIALOG_STUCK_LIMIT:
                     _log.warning("login: 提示弹窗连续 %d 轮关不掉，放弃", stuck)
                     return None
-            time.sleep(0.8)
+            time.sleep(_sec(cfg, "dialog_retry_pause"))
             continue
         # 登录按钮优先取可点按钮类区域；模板/YOLO 未就绪时为空，回退到全部文字
         button_texts = _button_texts(regions) or texts
-        hits = [b for b in LOGIN_BUTTONS if _hit(button_texts, (b,))]
-        loading = _hit(texts, LOADING_HINTS)
+        hits = [b for b in _kw(cfg, "login_buttons") if _hit(button_texts, (b,))]
+        loading = _hit(texts, _kw(cfg, "loading_hints"))
         if hits and not loading:
             return hits[0]
-        time.sleep(1.0)
+        time.sleep(_sec(cfg, "loading_poll_pause"))
     return None
 
 
-def _has_dialog(texts: list[str], regions=None) -> bool:
+def _has_dialog(texts: list[str], regions=None, cfg: dict | None = None) -> bool:
     """画面里是否有挡路的提示弹窗：弹窗区域、确认按钮或已知正文任一命中。
 
     regions 传多层融合结果时，kind=dialog 的区域（模板 dialog_bg / YOLO dialog）
@@ -497,9 +533,9 @@ def _has_dialog(texts: list[str], regions=None) -> bool:
     """
     if regions is not None and any(r.kind == "dialog" and r.text for r in regions):
         return True
-    if _hit(texts, DIALOG_CONFIRM_BUTTONS):
+    if _hit(texts, _kw(cfg, "dialog_confirm_buttons")):
         return True
-    return _hit(texts, DIALOG_HINTS)
+    return _hit(texts, _kw(cfg, "dialog_hints"))
 
 
 def _confirm_dialog(ctx: BotContext, regions, results, texts: list[str],
@@ -512,7 +548,7 @@ def _confirm_dialog(ctx: BotContext, regions, results, texts: list[str],
     某个按钮点到上限后换下一个候选（而不是整体放弃）；连按钮文案都认不出时，
     按正文位置向下偏移兜底点一次，应对 OCR 把「确认」识别成别的字。
     """
-    if _hit(texts, MAIN_SCENE_HINTS):
+    if _hit(texts, _kw(ctx.cfg, "main_scene_hints")):
         return False
 
     # 1) 模板命中：close_x / confirm 直接给出精确中心，比 OCR 文字框稳
@@ -527,11 +563,11 @@ def _confirm_dialog(ctx: BotContext, regions, results, texts: list[str],
         ctx.input.click(point[0], point[1])
         if dialogs is not None:
             dialogs.append(name)
-        time.sleep(0.6)
+        time.sleep(_sec(ctx.cfg, "dialog_click_pause"))
         return True
 
     # 2) 文字匹配：确定 / 确认 / 我知道了
-    for button in DIALOG_CONFIRM_BUTTONS:
+    for button in _kw(ctx.cfg, "dialog_confirm_buttons"):
         if not _hit(texts, (button,)):
             continue
         if dialogs is not None and dialogs.count(button) >= DIALOG_MAX_CLICKS:
@@ -544,14 +580,14 @@ def _confirm_dialog(ctx: BotContext, regions, results, texts: list[str],
         ctx.input.click(hit.cx, hit.cy)
         if dialogs is not None:
             dialogs.append(button)
-        time.sleep(0.6)
+        time.sleep(_sec(ctx.cfg, "dialog_click_pause"))
         return True
 
     # 兜底：正文命中但按钮认不出，在正文块下方点一次（弹窗按钮通常居中排在文字下面）
     if dialogs is not None and dialogs.count("fallback") >= DIALOG_MAX_CLICKS:
         return False
     body = None
-    for hint in DIALOG_HINTS:
+    for hint in _kw(ctx.cfg, "dialog_hints"):
         hit = BotContext.find_in(results, hint)
         if hit is not None and (body is None or hit.cy > body.cy):
             body = hit  # 取最靠下的一句，避免点到标题行
@@ -562,19 +598,19 @@ def _confirm_dialog(ctx: BotContext, regions, results, texts: list[str],
     ctx.input.click(x, y)
     if dialogs is not None:
         dialogs.append("fallback")
-    time.sleep(0.6)
+    time.sleep(_sec(ctx.cfg, "dialog_click_pause"))
     return True
 
 
-def _main_scene_hit(texts: list[str]) -> bool:
+def _main_scene_hit(texts: list[str], cfg: dict | None = None) -> bool:
     """这批 OCR 文本是否属于游戏主界面。
 
     只看「商城/任务」会误判：商城面板里同样有「商城」，还可能顺带出现「地图」。
     所以要求命中背包栏/地图名这类强特征，或者三个以上弱特征同时出现
     （商城面板实测只命中「商城」「地图」两个）。
     """
-    strong = _hit(texts, MAIN_SCENE_STRONG)
-    weak = sum(1 for h in MAIN_SCENE_HINTS if _hit(texts, (h,)))
+    strong = _hit(texts, _kw(cfg, "main_scene_strong"))
+    weak = sum(1 for h in _kw(cfg, "main_scene_hints") if _hit(texts, (h,)))
     return strong or weak >= 3
 
 
@@ -584,7 +620,7 @@ def _in_main_scene(ctx: BotContext, cfg: dict) -> bool:
     只需全图 OCR 原文（HUD 文字不会被遮挡），不必跑区域融合：旧实现走 ctx.analyze()
     会额外触发两次模型推理 + 每框一次区内 OCR，结果却只用到了文字。
     """
-    return _main_scene_hit([r.text for r in ctx.ocr()])
+    return _main_scene_hit([r.text for r in ctx.ocr()], cfg)
 
 
 def _advance_to_main_scene(ctx: BotContext, cfg: dict, timeout: float,
@@ -606,15 +642,15 @@ def _advance_to_main_scene(ctx: BotContext, cfg: dict, timeout: float,
         # 与 _wait_ready 一致：一帧只 OCR 一次，融合结果同时供弹窗/按钮/文案判定
         regions = ctx.analyze(img, results)
         texts = _region_texts(regions)
-        if _main_scene_hit(texts):
+        if _main_scene_hit(texts, cfg):
             return True
-        if _has_dialog(texts, regions):
+        if _has_dialog(texts, regions, cfg):
             _confirm_dialog(ctx, regions, results, texts, dialogs)
-            time.sleep(0.8)
+            time.sleep(_sec(cfg, "dialog_retry_pause"))
             continue
-        loading = _hit(texts, LOADING_HINTS)
+        loading = _hit(texts, _kw(cfg, "loading_hints"))
         button = (None if loading
-                  else _pick_button(ENTER_BUTTONS, _button_texts(regions) or texts,
+                  else _pick_button(_kw(cfg, "enter_buttons"), _button_texts(regions) or texts,
                                     lambda b: clicks.get(b, 0), ENTER_MAX_CLICKS))
         hit = BotContext.find_in(results, button) if button else None
         if hit is not None:
@@ -622,7 +658,7 @@ def _advance_to_main_scene(ctx: BotContext, cfg: dict, timeout: float,
                       button, hit.cx, hit.cy, clicks.get(button, 0) + 1)
             ctx.input.click(hit.cx, hit.cy)
             clicks[button] = clicks.get(button, 0) + 1
-            time.sleep(ENTER_CLICK_WAIT)
+            time.sleep(_sec(cfg, "enter_click_wait"))
             continue
-        time.sleep(1.2)
+        time.sleep(_sec(cfg, "advance_poll_pause"))
     return False

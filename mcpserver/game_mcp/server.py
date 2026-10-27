@@ -18,6 +18,7 @@ import inspect
 import os
 import platform
 import signal
+import threading
 import time
 from typing import List, Optional
 
@@ -54,12 +55,26 @@ def _ms(started: float) -> int:
 # 豁免名单：不查暂停、永远立即返回。模型看到 paused 就知道该等，而不是重试狂点。
 _PAUSE_EXEMPT = frozenset({"ping", "list_windows", "game_status"})
 
+# 写操作工具：它们共用唯一的一套鼠标键盘和唯一的一个游戏窗口，必须串行。
+# 并发是真实存在的：host 与 Swing 客户端是两条独立 MCP 连接，一次单步推进（daily_task）
+# 期间另一路调 click_point，两次 program_action 会交错，鼠标插值互相
+# 打断（_move_to_raw 会读到对方的中途坐标），表现出来就是「点歪」。
+_WRITE_TOOLS = frozenset({
+    "click_point", "click_text", "press_key",
+    "open_game", "close_game", "login", "back_to_main", "daily_task", "market_scan",
+})
+
+# 可重入：工具实现内部若再调受管控的工具，不会把自己锁死。
+_WRITE_LOCK = threading.RLock()
+# 当前持锁的工具名（栈）：只用于 busy 提示与日志，不参与判定。
+_running: List[str] = []
+
 
 def _pause_block(name: str):
     """工具入口统一查人工接管暂停。返回 None 表示可以继续，否则返回提示 dict。
 
-    用 max_block_sec 封顶（默认 30s）：长流程（daily_task）本来就阻塞，等 10s 无妨；
-    但 ocr / click_point 这类短工具若阻塞太久，客户端会以为是卡死。
+    用 max_block_sec 封顶（默认 30s）：单步推进（daily_task）本来就要等一轮模型，
+    等 10s 无妨；但 ocr / click_point 这类短工具若阻塞太久，客户端会以为是卡死。
     """
     if name in _PAUSE_EXEMPT:
         return None
@@ -90,11 +105,27 @@ def tool(fn):
     return wrapped
 
 
-def _traced(fn):
-    """给工具函数套一层日志：一次调用一条日志，异常先留痕再原样抛出。
+def _returns_dict(sig: inspect.Signature) -> bool:
+    """工具的返回注解是否为 dict。
 
-    入口统一检查人工接管暂停：短工具（ocr/click_point 等）最多阻塞 max_block_sec，
-    超时直接返回 paused=true，避免客户端表现为“卡死”。
+    本模块用了 `from __future__ import annotations`，注解是字符串，不能直接和 dict 比。
+    没标注的按 dict 处理（绝大多数工具都是 dict）。
+    """
+    ann = sig.return_annotation
+    if ann is inspect.Signature.empty:
+        return True
+    name = ann if isinstance(ann, str) else getattr(ann, "__name__", "")
+    return name in ("dict", "Dict") or name.startswith(("dict[", "Dict["))
+
+
+def _traced(fn):
+    """给工具函数套一层日志：一次调用一条日志，异常先留痕再转成 ok=false。
+
+    入口统一做三件事：
+      1. 检查人工接管暂停：短工具最多阻塞 max_block_sec，超时直接返回 paused=true，
+         避免客户端表现为“卡死”；
+      2. 写操作串行（见 _WRITE_TOOLS）：抢不到锁立即返回 busy=true，不排队；
+      3. 异常兜底：返回 dict 的工具转成 ok=false，模型能看懂下一步该干什么。
     """
     sig = inspect.signature(fn)
     name = fn.__name__
@@ -111,6 +142,17 @@ def _traced(fn):
             log.warning("工具 %s 因人工操作暂停而跳过 %dms 参数=%s",
                         name, _ms(started), shown)
             return blocked
+        holding = name in _WRITE_TOOLS
+        if holding:
+            # 不排队等：长任务可能还要跑几分钟，短工具排到天荒地老，模型只能以为卡死。
+            # 直接回 busy=true，让调用方知道「现在有别的操作在占着画面」而不是「点击无效」。
+            if not _WRITE_LOCK.acquire(blocking=False):
+                busy = _running[-1] if _running else "另一个操作类工具"
+                log.warning("工具 %s 被拒：%s 正在执行 %dms 参数=%s",
+                            name, busy, _ms(started), shown)
+                return {"ok": False, "busy": True,
+                        "error": f"「{busy}」正在执行，画面与输入都由它占用；等它结束再调 {name}"}
+            _running.append(name)
         try:
             result = fn(*args, **kwargs)
         except WindowNotFound as e:
@@ -118,10 +160,19 @@ def _traced(fn):
             log.warning("工具 %s 无可用窗口 %dms 参数=%s: %s",
                         name, _ms(started), shown, e)
             return _err(str(e))
-        except Exception as e:  # noqa: BLE001 照旧抛给 MCP，但先留痕
+        except Exception as e:  # noqa: BLE001
             log.error("工具 %s 异常 %dms 参数=%s: %s",
                       name, _ms(started), shown, e, exc_info=True)
+            # 返回 dict 的工具统一转成 ok=false：模型拿到结构化字段比拿到协议层异常
+            # 更好判断下一步。返回 list/str 的工具塞不进 dict，只能原样抛（否则签名对不上）。
+            if _returns_dict(sig):
+                return _err(f"{name} 异常: {type(e).__name__}: {e}")
             raise
+        finally:
+            if holding:
+                if _running:
+                    _running.pop()
+                _WRITE_LOCK.release()
         if isinstance(result, dict) and result.get("ok") is False:
             log.warning("工具 %s 失败 %dms 参数=%s 结果=%s",
                         name, _ms(started), shown, runlog.brief(result, 300))
@@ -271,10 +322,12 @@ def detect(classes: Optional[List[str]] = None, layer: str = "all") -> dict:
 def click_point(x: float, y: float, dry_run: bool = False) -> dict:
     """已知目标的像素坐标时用它精确点击：坐标系与 ocr 的 box、capture 的截图一致（不是屏幕坐标）。
 
-    dry_run=True 只打印不点击。真实操作：只在用户明确要求，或看屏确认位置后使用。
+    dry_run=True 只打印不点击。窗口不在前台时不点击并返回 ok=false（避免点到其他应用）。
+    真实操作：只在用户明确要求，或看屏确认位置后使用。
     """
     ctx = _make_ctx(dry_run=dry_run)
-    ctx.click_point(x, y)
+    if not ctx.click_point(x, y):
+        return _err(f"点击 ({x},{y}) 未发送：游戏窗口不在前台或自动化已暂停，详见 mcpserver.log")
     return _ok(clicked=[x, y], dry_run=dry_run)
 
 
@@ -283,12 +336,13 @@ def click_text(text: str, dry_run: bool = False) -> dict:
     """已知目标文字、且画面里该文字唯一时用：找包含 text 的文本并点它的中心。
 
     默认最多等 10 秒，找不到返回 ok=false 且不点击；有多个同名文本时改用 ocr 拿 cx/cy 再 click_point。
-    dry_run=True 只打印不点击。真实操作：只点用户明确指定的目标。
+    dry_run=True 只打印不点击。窗口不在前台时同样不点击（返回 ok=false）。
+    真实操作：只点用户明确指定的目标。
     """
     ctx = _make_ctx(dry_run=dry_run)
     hit = ctx.click_text(text)
     if not hit:
-        return _err(f"未找到文本: {text}")
+        return _err(f"未点击「{text}」：画面上没找到该文本，或游戏窗口不在前台无法发送点击")
     return _ok(clicked_text=text, dry_run=dry_run)
 
 
@@ -310,7 +364,8 @@ def press_key(key: str, dry_run: bool = False) -> dict:
 def advise(goal: str = "", dry_run: bool = True) -> dict:
     """只想让视觉模型给一步建议、不执行任何动作时用：返回 scene/reason/done/actions/clickable/context。
 
-    goal 是本次目标（为空按“推进当前任务”），必须来自用户原话。要真正连续推进用 daily_task。
+    goal 是本次目标（为空按“推进当前任务”），必须来自用户原话。要一步一步真正推动游戏用
+    daily_task（它也是单步，可反复调用）。
     clickable 是带 id 的可点项（现阶段只有按钮类区域），context 是只读画面信息，模型只能从 clickable 选 id。
     dry_run 对 advise 无实际影响（它从不点击）。
     """
@@ -411,23 +466,29 @@ def back_to_main(max_steps: int = 8) -> dict:
 
 
 @tool
-def daily_task(goal: str = "", max_steps: int = 120, dry_run: bool = False) -> dict:
-    """用户说“做师门任务”“做任务”时用：自动循环推进师门任务，内部自己“看屏 -> 决策 -> 点击”，
-    返回 ok/task/steps，默认目标是完成师门任务。
+def daily_task(goal: str = "", max_steps: int = 1, dry_run: bool = False) -> dict:
+    """用户说“做师门任务”“做任务”时用：推进一步师门任务（单步），把过程原样返回。
 
-    goal 为空用内置目标；max_steps 是循环上限（默认 120 步，每步调一次视觉模型，整体可能几分钟）；
-    dry_run=True 只看不动。属长耗时操作，调用前先确认游戏已登录进主界面。
+    一次调用只走一步：识别当前画面 -> 视觉模型从可点项里选 -> 用我方坐标点击/按键。
+    返回字段：scene（当前界面）/ reason（为什么这么选）/ chosen（选了什么，带回填文字）/
+    executed（实际发出几个动作）/ done（是否已完成）/ clickable、context（本帧可点项与只读信息）/
+    n_clickable（本帧可点候选数，参数被截断时看它）/ note（没执行时的原因）。
+    循环交给调用方：没 done 且 executed>0 就接着调（goal 照旧，参数重复不算卡住）；
+    executed=0 先看 note（可点为空/窗口不在前台/被人工接管），连续两三次仍无动作就停下汇报；
+    done=true 收尾。最大步数由调用方的轮数上限控制，本工具默认只走一步（max_steps>1 仅调试用）。
+    dry_run=True 只看不动。属操作类长耗时（单步约 3~10s），调用前先确认游戏已登录进主界面。
     """
     ctx = _make_ctx(dry_run=dry_run)
     return daily_tools.daily_task(ctx, goal=goal, max_steps=max_steps)
 
 
 @tool
-def market_scan(goal: str = "", max_steps: int = 120, dry_run: bool = False) -> dict:
-    """用户说“扫货”“去集市买东西”时用：自动循环在集市里挑符合条件的商品，返回 ok/task/steps。
+def market_scan(goal: str = "", max_steps: int = 1, dry_run: bool = False) -> dict:
+    """用户说“扫货”“去集市买东西”时用：推进一步集市扫货（单步），返回同样的过程字段。
 
-    goal 可传筛选条件（如“只买低于 1 万的宝石”）；max_steps 是循环上限（默认 120 步）；
-    dry_run=True 只看不动。需要游戏已停在集市/商铺界面，否则大概率空转。
+    goal 可传筛选条件（如“只买低于 1 万的宝石”）；每次只看一帧、只做一组动作，
+    done=true 表示买完或无合适物品。需要游戏已停在集市/商铺界面，否则大概率空转（executed=0）。
+    max_steps 默认 1（>1 仅调试用）；dry_run=True 只看不动。
     """
     ctx = _make_ctx(dry_run=dry_run)
     return daily_tools.market_scan(ctx, goal=goal, max_steps=max_steps)

@@ -18,6 +18,7 @@ import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -42,6 +43,10 @@ public class AiChatService {
 
     private static final int MAX_TOOL_RESULT_CHARS = 1600;
     private static final int MAX_HISTORY_MESSAGES = 40;
+    // 单步推进类工具：一次只走一步，进度（executed/done）在返回值里。它们的参数每步都一样，
+    // 所以不能按「同一工具+同一参数重复」判卡住，只能按「连续几步没发出任何动作」判。
+    private static final Set<String> STEP_TOOLS = Set.of("daily_task", "market_scan");
+    private static final int STEP_IDLE_LIMIT = 3;
 
     private static final String SYSTEM_PROMPT = """
             你是「问道」桌面自动化的对话调试助手，运行在 host 层，通过 MCP 客户端调用 mcpserver 的工具。
@@ -64,8 +69,13 @@ public class AiChatService {
             4) tool 与 reply 二选一：要调工具就把 reply 留空；要回答就把 tool 留空并 done=true。
                工具结果已经能回答用户时（例如问「游戏开了吗」拿到 game_status 后），下一轮必须收尾，
                不要重复调用同一个工具。
-            5) 用户明确给出游戏目标（例如“做一下师门任务”）时，按「先看屏 -> 再决策 -> 执行 -> 复检」推进，
-               最多几步就先汇报进展，不要无限点。
+            5) 单步推进类工具（daily_task / market_scan）一次只走一步，返回值里有
+               scene / reason / chosen / executed / done：
+               - done=true：目标已达成，用 reply 汇报结果并收尾；
+               - executed>0：接着调同一个工具推下一步（goal 照旧即可，参数重复不算卡住）；
+               - executed=0：先读 note。可点为空 / 窗口不在前台 / 被人工接管时不要连着重试，
+                 先查清状态或直接告诉用户；连续两三次仍无动作就停下汇报。
+               其余操作类工具不是单步，仍按第 3 条：同一工具同一参数失败两次就停。
             6) 只使用清单里真实存在的工具名，不要发明工具。
             7) 窗口不可见/被最小化时，如实告诉用户“需要手动切到前台”，不要尝试用按键去切窗口。
             8) 目标只来自用户原话：用户没提的事不要替他决定，不要自行补出「师门任务」「领奖励」。
@@ -150,6 +160,8 @@ public class AiChatService {
         List<Map<String, Object>> steps = new ArrayList<>();
         // 同一「工具+参数」的尝试次数：模型有时会绕着同一件事反复撞墙，这里做硬限制
         Map<String, Integer> attempts = new LinkedHashMap<>();
+        // 单步类工具的「空转」计数：按返回值判，而不是按参数重复次数判
+        int stepIdle = 0;
         String catalog = catalog();
 
         for (int round = 1; round <= maxRounds; round++) {
@@ -231,19 +243,34 @@ public class AiChatService {
                 return result(true, terminalReply(tool, output), steps, round);
             }
 
-            int tried = attempts.merge(tool + " " + toJson(args), 1, Integer::sum);
-            if (tried >= 2 && bad) {
-                return result(false, "同一操作已失败 " + tried + " 次，先停在这里：" + rendered, steps, round);
-            }
-            if (tried >= 3) {
-                // 模型已经给出结论，只是漏了 done：直接用它的 reply 收尾，别把回答埋进错误里
-                String reply = text(plan.get("reply"));
-                if (!reply.isBlank()) {
-                    turn.note("同一操作重复 " + tried + " 次且模型已给出结论，按其 reply 收尾");
-                    return result(true, reply, steps, round);
+            if (STEP_TOOLS.contains(tool)) {
+                // 单步推进：参数每步都一样，不能按「同参数重复」判卡住；看返回值里有没有真的动了
+                int executed = executedCount(output);
+                if (bad || executed == 0) {
+                    stepIdle++;
+                    turn.note(tool + " 本步无动作（" + (bad ? "调用失败" : "executed=0") + "）");
+                    if (stepIdle >= STEP_IDLE_LIMIT) {
+                        return result(false, "连续 " + stepIdle + " 步没有产生任何动作，疑似卡住先停在这里："
+                                + rendered, steps, round);
+                    }
+                } else {
+                    stepIdle = 0;
                 }
-                return result(false, "同一操作重复 " + tried + " 次，疑似卡住，先停在这里：" + rendered,
-                        steps, round);
+            } else {
+                int tried = attempts.merge(tool + " " + toJson(args), 1, Integer::sum);
+                if (tried >= 2 && bad) {
+                    return result(false, "同一操作已失败 " + tried + " 次，先停在这里：" + rendered, steps, round);
+                }
+                if (tried >= 3) {
+                    // 模型已经给出结论，只是漏了 done：直接用它的 reply 收尾，别把回答埋进错误里
+                    String reply = text(plan.get("reply"));
+                    if (!reply.isBlank()) {
+                        turn.note("同一操作重复 " + tried + " 次且模型已给出结论，按其 reply 收尾");
+                        return result(true, reply, steps, round);
+                    }
+                    return result(false, "同一操作重复 " + tried + " 次，疑似卡住，先停在这里：" + rendered,
+                            steps, round);
+                }
             }
         }
         return result(false, "工具调用轮数已达上限（" + maxRounds + "），请补充指令继续",
@@ -274,6 +301,14 @@ public class AiChatService {
             case "close_game" -> !containsAny(userText, "登录", "打开", "启动");
             default -> false;
         };
+    }
+
+    /** 单步类工具本步实际发出了几个动作（读返回值里的 executed，缺失当 0）。 */
+    private static int executedCount(Object output) {
+        if (output instanceof Map<?, ?> m && m.get("executed") instanceof Number n) {
+            return n.intValue();
+        }
+        return 0;
     }
 
     private static boolean containsAny(String text, String... hints) {

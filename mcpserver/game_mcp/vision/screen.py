@@ -222,6 +222,23 @@ def top_layer_box(img: np.ndarray) -> Optional[Box]:
             min(w, int(x2 * sx) + _TOP_MARGIN), min(h, int(y2 * sy) + _TOP_MARGIN))
 
 
+# ---------- 画面指纹 ----------
+# 32x32 均值缩略图：一格约 25x19px（788 宽），大致是一个字符的大小
+_FRAME_GRID = (32, 32)
+
+
+def frame_hash(img: np.ndarray) -> bytes:
+    """画面指纹：32x32 均值缩略图，用来判「这一帧跟上一帧是否一样」。
+
+    为什么值得做：实测整图 OCR ≈1.3s、模板+YOLO 融合 ≈1.3s，而指纹只要 ~3ms。
+    点了没反应的时候画面纹丝不动，这两笔钱每轮白付，决策循环就多慢一步。
+    取 32x32 而不是 8x8 是故意的：一格约一个字，文本行变一个字就能看出来。
+    宁可多算一次，也别因为「看起来差不多」让模型对着过期画面做决定。
+    """
+    small = cv2.resize(img, _FRAME_GRID, interpolation=cv2.INTER_AREA)
+    return small.astype(np.uint8).tobytes()
+
+
 def _texts_in(results: List[OcrResult]) -> Tuple[str, List[Tuple[int, int]]]:
     """把一批 OCR 结果按行序拼成文本，并给出每块文字的中心点。"""
     ordered = sorted(results, key=lambda r: (round(r.cy / 10), r.cx))

@@ -34,7 +34,7 @@ from typing import List, Optional, Tuple
 from ..core import decision_log
 from ..core.log import get_logger
 from .collect import collect_failed_shot
-from .screen import _center_in, screen_key, top_layer_box
+from .screen import _center_in, frame_hash, screen_key, top_layer_box
 
 _log = get_logger("vision.llm")
 
@@ -485,105 +485,202 @@ class Advisor:
         data["context"] = context
         return data
 
-# ---------- 连续决策循环 ----------
-def run_advisor_loop(ctx, goal: str = "", max_steps: int = 120,
-                     idle_limit: int = 4, step_pause: Optional[float] = None) -> int:
-    """纯「识别 → 大模型决策 → 执行」连续循环（先标注后决策）：
-      每轮 snapshot -> ctx.analyze 四层融合出区域 -> build_candidates 分流可点/只读
-      -> advisor.choose 只从可点项选 id -> execute_choice 用我方坐标回填点击。
-    直到 done / 连续无动作 / 达到 max_steps / 被急停。返回实际轮数。
-    节奏参数（step_pause / idle_pause / click_pause）由 config.timing 控制，默认已调快。
+# ---------- 单步推进（循环由调用方驱动） ----------
+# 以前这里是 run_advisor_loop：一次工具调用内部自己转 120 步，外层模型只拿到一个
+# steps 数字，看不到过程也无法纠偏。现在一次调用只走一步，过程全写进返回值，
+# 循环交给 host 的轮数上限（maxRounds）驱动。
+#
+# 绕圈规避本来只在一次调用内有效，改成单步后必须跨调用保留，所以状态提到模块级：
+#   tried_by_screen  某画面上哪些选项选了会绕回来
+#   trail            最近几步的 (画面, 选中项)，用来定位是哪一步导致绕回来
+#   hash / regions   上一帧指纹与识别结果（点了没反应时直接复用，省掉 ~2.6s）
+_STEP_STATE: dict = {}
+_TRAIL_MAX = 8
+# 两步之间隔这么久，就当是另一次任务了：外层循环是秒级的，静默两分钟说明人已走开
+_STATE_IDLE_RESET_SEC = 120.0
+
+
+def step_state(key: str = "default") -> dict:
+    """取（或建）某个任务的推进状态。key 用任务名（如 daily_task）。"""
+    st = _STEP_STATE.get(key)
+    if st is None:
+        st = {"goal": "", "tried_by_screen": {}, "trail": [], "steps": 0,
+              "hash": None, "regions": None, "ts": 0.0}
+        _STEP_STATE[key] = st
+    return st
+
+
+def reset_step_state(key: Optional[str] = None) -> None:
+    """清空推进状态：任务完成、目标变了、或调用方要重新开始时用。"""
+    if key is None:
+        _STEP_STATE.clear()
+    else:
+        _STEP_STATE.pop(key, None)
+
+
+def step_once(ctx, goal: str = "", state_key: str = "default") -> dict:
+    """推进一步：识别一帧 → 让模型从可点项里选 → 用我方坐标执行。
+
+    返回过程字段（外层模型靠这些判断下一步，不再只看到一个步数）：
+      scene / reason      模型对当前界面的判断与理由
+      chosen              选中的项（id + 回填文字 + 类型），坐标不经过模型
+      executed            实际发出去的动作数
+      done                模型是否判定目标已达成
+      clickable / context 本帧的可点候选与只读信息（n_clickable 是候选数，列表被截断时看它）
+      step                本任务累计走到第几步
+      note                没执行时的原因（可点为空 / 窗口不在前台 / 人工接管 / 没选中）
+    大模型调用失败返回 ok=false，不往外抛；其余异常照旧上抛给工具层兜底。
     """
     from ..core import input as user_input
-    default_goal = "持续推进并完成当前可做的游戏任务（优先右侧任务追踪的目标）"
-    goal = goal or default_goal
-    if step_pause is None:
-        step_pause = _timing(ctx, "step_pause", 0.4)
-    idle_pause = _timing(ctx, "idle_pause", 0.8)
-    steps = 0
-    idle = 0
-    # 绕圈规避：以"画面"为单位记录哪些选项是错的选择（点了会绕回旧画面），
-    # 下次回到该画面就推进到下一个没选过的选项——而不是把重复项永久拉黑
-    # （一个画面的选项轮完一轮后清空记录、允许回头再点）。
-    tried_by_screen: dict = {}     # screen_key(frozenset 文字) -> set(错选文字)
-    trail: list = []               # 最近若干轮的 (screen_key, 选中文字tuple)
-    TRAIL_MAX = 8
+    st = step_state(state_key)
+    goal = goal or "持续推进并完成当前可做的游戏任务（优先右侧任务追踪的目标）"
+    if st["ts"] and time.time() - st["ts"] > _STATE_IDLE_RESET_SEC:
+        # 隔了很久才来的下一步：当成新任务，别拿上次的「选这个会绕回来」误导它
+        _log.info("距上一步已超过 %.0fs，按新任务重算推进状态", _STATE_IDLE_RESET_SEC)
+        reset_step_state(state_key)
+        st = step_state(state_key)
+    if st["goal"] and st["goal"] != goal:
+        # 换目标了：旧的「选这个会绕回来」记录对新目标没有意义，清掉免得误导
+        _log.info("目标变了，清空上一目标的推进状态")
+        reset_step_state(state_key)
+        st = step_state(state_key)
+    st["goal"] = goal
+    st["ts"] = time.time()
 
-    while steps < max_steps and not user_input.is_stopped():
-        # 人工接管中则在这里等（等不到就整轮结束，绝不带着用户操作状态去点鼠标）
-        if not ctx.guard():
-            _log.warning("人工接管等待被中断，结束循环")
-            break
-        # 记下本轮开始时的暂停代次：算完候选后若已变化，说明期间被人接管过，
-        # 暂停前的截图与坐标全部作废，必须重新感知一轮。
-        gen = ctx.guard_generation()
-        steps += 1
-        img, results = ctx.snapshot()
-        # 四层融合（模板 → UITag → 通用 → OCR）后再分流：只有 button / icon 类区域带 id 可点，其余只读
-        regions = ctx.analyze(img, results)
-        size = (img.shape[1], img.shape[0])
-        # 弹窗把背景压暗了？那背景里的按钮点不动，不能当候选（见 screen.top_layer_box）
-        top_box = top_layer_box(img) if ctx.advisor.gate_by_top_layer else None
-        clickable, context = build_candidates(regions, ctx.advisor.clickable_kinds,
-                                             ctx.advisor.clickable_sources, size=size,
-                                             top_box=top_box)
-        if not clickable:
-            # 可点为空 = 模板与 YOLO 都没认出按钮：正是按钮检测最该留样的失败画面
-            collect_failed_shot(ctx.cfg, img, regions, goal)
-        # 绕圈规避：若本画面是曾经到过的画面(说明绕回来了)，就把"导致绕回来的上一步
-        # 选择"在它所属画面内暂时避开，下次该画面改选下一个选项——而不是排除重复项。
-        key = screen_key(regions)
-        prev_keys = [k for (k, _) in trail]
-        if key in prev_keys and trail:
-            last_key, last_texts = trail[-1]
-            if last_texts:
-                tried_by_screen.setdefault(last_key, set()).update(last_texts)
-                _log.info("检测到绕圈：回到已访问画面，暂避上一步选项 %s（下次改选下一个，不永久排除）",
-                          list(last_texts))
-                del trail[:prev_keys.index(key) + 1]
-        tried = tried_by_screen.get(key, set())
-        advance = [c for c in clickable if c["text"] not in tried]
-        if not advance:
-            # 本画面选项已轮完一轮：清空记录允许回头再点（不永久排除重复项）
-            tried_by_screen[key] = set()
-            tried = set()
-            advance = list(clickable)
-        task_ctx = ""
-        if tried:
-            task_ctx = (f"｜注意：本画面这些选项之前选了会绕回来："
-                        f"{sorted(tried)}，"
-                         "请从剩余没试过的选项里选一个能真正推进任务的不同选项")
-        try:
-            plan = ctx.advisor.choose(advance, goal + task_ctx, context=context, size=size)
-        except LlmError as e:
-            _log.error("大模型调用失败，结束循环: %s", e)
-            break
-        picked = [cmap_find(advance, i) for i in plan.get("choose") or []]
-        picked_txt = [f"[{c['id']}]{c['text']}" for c in picked if c]
-        _log.info("大模型#%d scene=%s done=%s :: %s :: 选 %s", steps, plan.get("scene"),
-                  plan.get("done"), plan.get("reason"), picked_txt or plan.get("other") or "无")
-        if plan.get("done"):
-            _log.info("大模型目标已达成，结束循环（%d 轮）", steps)
-            break
-        if ctx.guard_generation() != gen:
-            _log.info("暂停期间画面已变，丢弃本轮候选重新感知")
-            continue
-        clicked_texts = [c["text"] for c in picked if c]
-        executed = execute_choice(ctx, advance, plan, generation=gen)
-        if executed:
-            idle = 0
-            # 记录本轮(画面, 选中项)：下一轮若回到旧画面即可据此定位"该换的下一步"
-            trail.append((key, tuple(clicked_texts)))
-            if len(trail) > TRAIL_MAX:
+    # 字段顺序是有意的：host 把工具结果转给外层模型时会截到 1600 字符，
+    # scene/reason/executed/chosen/note 这些判断用的必须排在候选清单前面，
+    # 否则一多就被截掉，外层模型又只能看到一个 ok。
+    out: dict = {"ok": True, "goal": goal, "step": st["steps"] + 1,
+                 "scene": "", "reason": "", "done": False, "executed": 0,
+                 "chosen": [], "note": "", "n_clickable": 0,
+                 "clickable": [], "context": []}
+
+    # 人工接管中就在这里等（等不到就本步作废，绝不带着用户操作状态去点鼠标）
+    if not ctx.guard():
+        out["ok"] = False
+        out["note"] = "人工接管等待被中断，本步未做任何动作"
+        return out
+    # 记下本步开始时的暂停代次：算完候选后若已变化，说明期间被人接管过，坐标作废
+    gen = ctx.guard_generation()
+    st["steps"] = out["step"]
+
+    img = ctx.grab()
+    fhash = frame_hash(img)
+    if st["regions"] is not None and fhash == st["hash"]:
+        # 画面与上一步完全一致：区域必然一样，直接用上帧结果，省掉整图 OCR + 两次检测
+        regions = st["regions"]
+        _log.debug("画面与上帧一致，复用上帧识别结果（%d 区域）", len(regions))
+    else:
+        # 四层融合（模板 → UITag → 通用 → OCR）后再分流：只有 button / icon 类区域带 id 可点
+        regions = ctx.analyze(img, ctx.ocr(img))
+        st["hash"], st["regions"] = fhash, regions
+    size = (img.shape[1], img.shape[0])
+    # 弹窗把背景压暗了？那背景里的按钮点不动，不能当候选（见 screen.top_layer_box）
+    top_box = top_layer_box(img) if ctx.advisor.gate_by_top_layer else None
+    clickable, context = build_candidates(regions, ctx.advisor.clickable_kinds,
+                                         ctx.advisor.clickable_sources, size=size,
+                                         top_box=top_box)
+    out["clickable"], out["context"] = clickable, context
+    out["n_clickable"] = len(clickable)
+
+    if not clickable:
+        # 可点为空 = 模板与检测层都没认出按钮：正是按钮检测最该留样的失败画面
+        collect_failed_shot(ctx.cfg, img, regions, goal)
+        out["note"] = "本帧没有可点候选（模板与检测层都没认出按钮），未做任何动作"
+        return out
+
+    # 绕圈规避：若本画面是曾经到过的画面(说明绕回来了)，就把"导致绕回来的上一步
+    # 选择"在它所属画面内暂时避开，下次该画面改选下一个选项——而不是排除重复项。
+    key = screen_key(regions)
+    trail = st["trail"]
+    prev_keys = [k for (k, _) in trail]
+    if key in prev_keys and trail:
+        last_key, last_texts = trail[-1]
+        if last_texts:
+            st["tried_by_screen"].setdefault(last_key, set()).update(last_texts)
+            _log.info("检测到绕圈：回到已访问画面，暂避上一步选项 %s（下次改选下一个，不永久排除）",
+                      list(last_texts))
+            del trail[:prev_keys.index(key) + 1]
+    tried = st["tried_by_screen"].get(key, set())
+    advance = [c for c in clickable if c["text"] not in tried]
+    if not advance:
+        # 本画面选项已轮完一轮：清空记录允许回头再点（不永久排除重复项）
+        st["tried_by_screen"][key] = set()
+        tried = set()
+        advance = list(clickable)
+    task_ctx = ""
+    if tried:
+        task_ctx = (f"｜注意：本画面这些选项之前选了会绕回来："
+                    f"{sorted(tried)}，"
+                     "请从剩余没试过的选项里选一个能真正推进任务的不同选项")
+    try:
+        plan = ctx.advisor.choose(advance, goal + task_ctx, context=context, size=size)
+    except LlmError as e:
+        _log.error("大模型调用失败: %s", e)
+        out["ok"] = False
+        out["note"] = f"大模型调用失败: {e}"
+        return out
+
+    out["scene"] = plan.get("scene")
+    out["reason"] = plan.get("reason")
+    out["done"] = bool(plan.get("done"))
+    picked = [c for c in (cmap_find(advance, i) for i in plan.get("choose") or []) if c]
+    out["chosen"] = [{"id": c["id"], "text": c["text"], "kind": c.get("kind")}
+                     for c in picked]
+    out["other"] = plan.get("other")
+    _log.info("单步#%d scene=%s done=%s :: %s :: 选 %s", out["step"], out["scene"],
+              out["done"], out["reason"],
+              [f"[{c['id']}]{c['text']}" for c in picked] or out["other"] or "无")
+
+    if out["done"]:
+        _log.info("模型判定目标已达成，清空本任务的推进状态")
+        reset_step_state(state_key)
+        out["note"] = "模型判定目标已达成"
+        return out
+    if ctx.guard_generation() != gen:
+        out["note"] = "等待期间被人工接管，候选作废，本步未执行（下一步重新感知）"
+        return out
+
+    out["executed"] = execute_choice(ctx, advance, plan, generation=gen)
+    if out["executed"]:
+        # 记录本步(画面, 选中项)：下一步若回到旧画面即可据此定位"该换的下一步"
+        if picked:
+            trail.append((key, tuple(c["text"] for c in picked)))
+            if len(trail) > _TRAIL_MAX:
                 trail.pop(0)
-            time.sleep(step_pause)
+        time.sleep(_timing(ctx, "step_pause", 0.4))
+    else:
+        out["note"] = "模型没选中可点项，或选中的动作没发出去（窗口不在前台/已暂停）"
+        time.sleep(_timing(ctx, "idle_pause", 0.8))
+    if user_input.is_stopped():
+        out["note"] = out["note"] or "已触发急停"
+    return out
+
+
+def run_advisor_loop(ctx, goal: str = "", max_steps: int = 120,
+                     idle_limit: int = 4, state_key: str = "cli") -> int:
+    """命令行/调试用的循环壳：反复调 step_once，直到 done / 连续无动作 / 步数上限。
+
+    MCP 工具不再走这里（daily_task 已是单步，循环交给 host 的轮数上限），
+    保留它只是为了离线调试还能一把跑完。返回累计步数。
+    """
+    from ..core import input as user_input
+    idle = 0
+    out: dict = {}
+    for _ in range(max(1, max_steps)):
+        if user_input.is_stopped():
+            break
+        out = step_once(ctx, goal, state_key=state_key)
+        if out.get("done") or not out.get("ok", True):
+            break
+        if out.get("executed"):
+            idle = 0
         else:
             idle += 1
-            time.sleep(idle_pause)
             if idle >= idle_limit:
-                _log.warning("连续 %d 轮无可执行动作（可能已无事可做/需人工），结束循环", idle)
+                _log.warning("连续 %d 步无可执行动作（可能已无事可做/需人工），结束循环", idle)
                 break
-    return steps
+    return int(out.get("step") or 0)
 
 
 def cmap_find(cands, cid):
@@ -611,15 +708,20 @@ def execute_choice(ctx, candidates: List[dict], plan: dict,
         c = cmap.get(cid)
         if not c:
             continue
-        ctx.input.click(c["x"], c["y"])
+        if not ctx.input.click(c["x"], c["y"]):
+            # 窗口不在前台/已暂停：后面几下同样发不出去，直接收尾，
+            # 别把没发出去的动作算成「已执行」回去骗外层模型
+            _log.warning("选中项 [%s] %s 未发出（窗口不在前台或已暂停），结束本轮",
+                         cid, c["text"])
+            break
         executed += 1
         time.sleep(_timing(ctx, "click_pause", 0.2))
     other = plan.get("other")
     if isinstance(other, dict):
         a = (other.get("action") or "").lower()
         if a == "press" and other.get("key"):
-            ctx.input.press_key(str(other["key"]))
-            executed += 1
+            if ctx.input.press_key(str(other["key"])):
+                executed += 1
         elif a == "wait":
             time.sleep(max(0.0, min(float(other.get("sec", 1)), 10.0)))
     return executed
