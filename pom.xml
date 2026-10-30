@@ -25,6 +25,9 @@
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
     <!-- 调用 macOS CoreGraphics/CoreFoundation 枚举窗口（Boot BOM 不管理 JNA） -->
     <jna.version>5.19.1</jna.version>
+    <!-- Boot 4 给测试 JVM 默认注入 -Djava.awt.headless=true，而截图/光标探测依赖 AWT；
+         这里覆写 argLine，让测试和 main() 里关 headless 的行为保持一致 -->
+    <argLine>-Djava.awt.headless=false</argLine>
   </properties>
 
   <dependencies>

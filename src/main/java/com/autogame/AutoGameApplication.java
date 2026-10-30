@@ -8,7 +8,7 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 
 /**
  * 桌面自动化工具的入口：应用启动/置顶、截图、鼠标键盘操作、视觉大模型识图，
- * 以及具体游戏（问道）的登录与日常任务。
+ * 以及具体游戏（问道）的页面识别——只看画面判断是什么页面，不替玩家做任何操作。
  */
 @SpringBootApplication
 @EnableConfigurationProperties({AutoGameProperties.class, WendaoProperties.class})
