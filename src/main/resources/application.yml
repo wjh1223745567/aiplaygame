@@ -30,6 +30,15 @@ autogame:
     save-by-default: false
   mouse:
     move-duration: 300ms
+  # 动作前置保障：先确保应用已启动并在顶层，再确认鼠标没被接管
+  guard:
+    window-timeout: 8s
+    # 距上次真实鼠标/键盘输入小于该值就当作人工正在操作，暂停动作（423）
+    idle-threshold: 800ms
+    # 用「光标挪不挪得动」判断是否被全屏游戏/远控独占
+    cursor-probe: true
+    # 检查远程控制类进程；常驻驱动/服务会误报，默认关，仅排查时打开
+    detect-hijackers: false
 
 logging:
   file:

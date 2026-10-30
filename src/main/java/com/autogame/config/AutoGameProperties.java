@@ -11,12 +11,13 @@ import org.springframework.util.unit.DataSize;
  * <p>注意：默认值用字面量常量而不是「静态 DEFAULTS 实例」，否则构造 DEFAULTS 时会读到尚未初始化的自身。
  */
 @ConfigurationProperties(prefix = "autogame")
-public record AutoGameProperties(Vision vision, Capture capture, Mouse mouse) {
+public record AutoGameProperties(Vision vision, Capture capture, Mouse mouse, Guard guard) {
 
     public AutoGameProperties {
         vision = vision == null ? Vision.defaults() : vision;
         capture = capture == null ? Capture.defaults() : capture;
         mouse = mouse == null ? Mouse.defaults() : mouse;
+        guard = guard == null ? Guard.defaults() : guard;
     }
 
     /**
@@ -88,5 +89,33 @@ public record AutoGameProperties(Vision vision, Capture capture, Mouse mouse) {
 
     private static String blankTo(String value, String fallback) {
         return value == null || value.isBlank() ? fallback : value.trim();
+    }
+
+    /**
+     * 动作前置保障：先确保应用已启动、已在顶层，再确认鼠标没被别人接管。
+     *
+     * @param windowTimeout   启动后等窗口出现的最长时长
+     * @param idleThreshold   距上次真实输入小于该值就当作「人工正在操作」，暂停动作
+     * @param detectHijackers 是否检查远程控制类进程；默认关，因为常驻驱动/服务会误报
+     * @param cursorProbe     是否用「光标挪不挪得动」判断被独占；默认开
+     */
+    public record Guard(Duration windowTimeout, Duration idleThreshold, Boolean detectHijackers, Boolean cursorProbe) {
+
+        private static final Duration DEFAULT_WINDOW_TIMEOUT = Duration.ofSeconds(8);
+        private static final Duration DEFAULT_IDLE_THRESHOLD = Duration.ofMillis(800);
+        private static final boolean DEFAULT_DETECT_HIJACKERS = false;
+        private static final boolean DEFAULT_CURSOR_PROBE = true;
+
+        public Guard {
+            windowTimeout = windowTimeout == null ? DEFAULT_WINDOW_TIMEOUT : windowTimeout;
+            idleThreshold = idleThreshold == null ? DEFAULT_IDLE_THRESHOLD : idleThreshold;
+            detectHijackers = detectHijackers == null ? DEFAULT_DETECT_HIJACKERS : detectHijackers;
+            cursorProbe = cursorProbe == null ? DEFAULT_CURSOR_PROBE : cursorProbe;
+        }
+
+        static Guard defaults() {
+            return new Guard(DEFAULT_WINDOW_TIMEOUT, DEFAULT_IDLE_THRESHOLD, DEFAULT_DETECT_HIJACKERS,
+                    DEFAULT_CURSOR_PROBE);
+        }
     }
 }

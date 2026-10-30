@@ -18,9 +18,6 @@ import org.springframework.web.bind.annotation.RestController;
 import com.autogame.service.operation.AppOperation;
 import com.autogame.support.ToolException;
 
-import tools.jackson.core.JacksonException;
-import tools.jackson.databind.ObjectMapper;
-
 /**
  * 应用操作统一入口：所有动作共用 {@link AppOperation} 接口，一个动作一个实现类，
  * 这里只负责按路径里的动作名找到实现并交给它执行，不含任何动作自己的逻辑。
@@ -41,13 +38,13 @@ public class AppController {
     private static final Logger log = LoggerFactory.getLogger(AppController.class);
 
     private final Map<String, AppOperation<?, ?>> operations;
-    private final ObjectMapper objectMapper;
+    private final RequestConverter requestConverter;
 
-    public AppController(List<AppOperation<?, ?>> operations, ObjectMapper objectMapper) {
+    public AppController(List<AppOperation<?, ?>> operations, RequestConverter requestConverter) {
         this.operations = operations.stream()
                 .collect(Collectors.toUnmodifiableMap(operation -> operation.action().toLowerCase(Locale.ROOT),
                         Function.identity()));
-        this.objectMapper = objectMapper;
+        this.requestConverter = requestConverter;
         log.info("已加载应用操作实现：{}", actions());
     }
 
@@ -69,17 +66,6 @@ public class AppController {
     }
 
     private <REQ, RES> RES execute(AppOperation<REQ, RES> operation, Map<String, Object> body) {
-        REQ request;
-        try {
-            request = objectMapper.convertValue(body, operation.requestType());
-        } catch (IllegalArgumentException | JacksonException e) {
-            throw ToolException.badRequest(operation.action() + " 的参数格式不对：" + firstLine(e));
-        }
-        return operation.execute(request);
-    }
-
-    private static String firstLine(Exception e) {
-        String message = e.getMessage();
-        return message == null ? e.getClass().getSimpleName() : message.lines().findFirst().orElse("");
+        return operation.execute(requestConverter.bind(body, operation.requestType(), operation.action()));
     }
 }

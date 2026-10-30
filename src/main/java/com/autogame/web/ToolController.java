@@ -18,8 +18,11 @@ import org.springframework.web.bind.annotation.RestController;
 import com.autogame.config.AutoGameProperties;
 import com.autogame.platform.CapturedImage;
 import com.autogame.platform.DesktopPlatform;
+import com.autogame.platform.DesktopRobot;
+import com.autogame.platform.InputActivity;
 import com.autogame.platform.WindowInfo;
 import com.autogame.service.AppService;
+import com.autogame.service.InputGuard;
 import com.autogame.service.MouseService;
 import com.autogame.service.ScreenService;
 import com.autogame.support.ToolException;
@@ -35,15 +38,24 @@ public class ToolController {
     private final ScreenService screenService;
     private final MouseService mouseService;
     private final DesktopPlatform platform;
+    private final InputActivity inputActivity;
+    private final InputGuard inputGuard;
+    private final DesktopRobot desktopRobot;
     private final AutoGameProperties.Vision visionConfig;
+    private final AutoGameProperties.Guard guardConfig;
 
     public ToolController(AppService appService, ScreenService screenService, MouseService mouseService,
-            DesktopPlatform platform, AutoGameProperties properties) {
+            DesktopPlatform platform, InputActivity inputActivity, InputGuard inputGuard,
+            DesktopRobot desktopRobot, AutoGameProperties properties) {
         this.appService = appService;
         this.screenService = screenService;
         this.mouseService = mouseService;
         this.platform = platform;
+        this.inputActivity = inputActivity;
+        this.inputGuard = inputGuard;
+        this.desktopRobot = desktopRobot;
         this.visionConfig = properties.vision();
+        this.guardConfig = properties.guard();
     }
 
     @GetMapping("/health")
@@ -56,6 +68,10 @@ public class ToolController {
         body.put("visionPrimaryModel", visionConfig.primaryModel());
         body.put("visionFallbackModel", visionConfig.fallbackModel());
         body.put("visionApiKeyConfigured", !visionConfig.apiKey().isBlank());
+        // 输入接管状态：排查「动作被 423 暂停」时先看这几项
+        body.put("inputIdleMs", inputActivity.idleMillis());
+        body.put("inputSyntheticAgeMs", desktopRobot.sinceLastInputMillis());
+        body.put("inputHijackers", inputActivity.hijackers());
         return body;
     }
 
@@ -101,6 +117,8 @@ public class ToolController {
         if (request == null || request.x() == null || request.y() == null) {
             throw ToolException.badRequest("x、y 不能为空");
         }
+        // 鼠标动作前先确认没被别人接管，否则回 423 让调用方暂停重试
+        inputGuard.ensureNotCaptured(guardConfig);
         var point = mouseService.moveTo(request.x(), request.y(), millis(request.durationMs(), 0, 10_000));
         return new PointResponse(point.x, point.y, mouseService.currentPosition());
     }
@@ -112,6 +130,7 @@ public class ToolController {
         }
         int count = request.count() == null ? 1 : request.count();
         boolean moveFirst = request.moveFirst() == null || request.moveFirst();
+        inputGuard.ensureNotCaptured(guardConfig);
         if (moveFirst) {
             mouseService.moveTo(request.x(), request.y(), millis(request.moveDurationMs(), 0, 10_000));
         }
