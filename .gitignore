@@ -10,6 +10,10 @@ logs/
 debug/
 *.log
 
+# 本机私密配置：密钥、账号密码（application.yml 会 optional 方式 import 它）
+application-local.yml
+*.local.yml
+
 # IDE / 系统
 .idea/
 *.iml
