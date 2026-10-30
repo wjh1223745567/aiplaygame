@@ -1,0 +1,38 @@
+server:
+  # 只监听本机：本服务能控制鼠标键盘，默认不对外暴露
+  address: 127.0.0.1
+  port: 8080
+
+spring:
+  application:
+    name: autogame-tool
+  # 必须关掉 headless：AWT Robot 靠它做截图和鼠标控制
+  main:
+    headless: false
+  threads:
+    virtual:
+      enabled: true
+
+autogame:
+  # 免费视觉大模型：智谱 GLM-4V-Flash（永久免费），OpenAI 兼容接口
+  # 备选：阿里百炼 OpenAI 兼容地址 https://dashscope.aliyuncs.com/compatible-mode/v1
+  vision:
+    base-url: https://open.bigmodel.cn/api/paas/v4
+    api-key: ${ZHIPU_API_KEY:}
+    primary-model: glm-4v-flash
+    fallback-model: glm-4.1v-thinking-flash
+    timeout: 60s
+    cooldown: 120s
+    max-image-bytes: 8MB
+  capture:
+    # 手动 save=true 时截图落盘目录
+    debug-dir: debug
+    save-by-default: false
+  mouse:
+    move-duration: 300ms
+
+logging:
+  file:
+    name: logs/autogame.log
+  level:
+    com.autogame: INFO

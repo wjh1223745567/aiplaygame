@@ -1,0 +1,17 @@
+# 项目内运行时（JDK 等大文件，用 scripts/env.sh + 镜像重下）
+.tools/
+
+# 构建产物
+target/
+*.jar.original
+
+# 运行时输出
+logs/
+debug/
+*.log
+
+# IDE / 系统
+.idea/
+*.iml
+.vscode/
+.DS_Store
