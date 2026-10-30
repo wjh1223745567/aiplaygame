@@ -42,7 +42,16 @@ public class AppPreflight {
      * @return 已在前台的目标窗口
      */
     public WindowInfo ensureReady(String app, String title) {
-        WindowInfo window = ensureRunning(app, title);
+        return ensureReady(app, title, guard.windowTimeout());
+    }
+
+    /**
+     * @param windowTimeout 启动后等窗口的最长时长；游戏类客户端启动慢，需要比全局配置更长；
+     *                      传 null 表示用全局配置
+     */
+    public WindowInfo ensureReady(String app, String title, Duration windowTimeout) {
+        Duration effective = windowTimeout == null ? guard.windowTimeout() : windowTimeout;
+        WindowInfo window = ensureRunning(app, title, effective);
         WindowInfo foreground = ensureForeground(app, title, window);
         inputGuard.ensureNotCaptured(guard);
         log.debug("前置保障完成：{} 已在前台（{}）", app, foreground);
@@ -50,15 +59,15 @@ public class AppPreflight {
     }
 
     /** 第一步：没启动就启动，启动后等窗口出现。 */
-    private WindowInfo ensureRunning(String app, String title) {
+    private WindowInfo ensureRunning(String app, String title, Duration windowTimeout) {
         AppService.StatusResult status = appService.status(app, null, title);
         if (status.running()) {
             return pickFrontmost(status.windows());
         }
         log.info("{} 未运行，先启动", app);
-        WindowInfo window = appService.launchAndWait(app, List.of(), Duration.ZERO, title, guard.windowTimeout());
+        WindowInfo window = appService.launchAndWait(app, List.of(), Duration.ZERO, title, windowTimeout);
         if (window == null) {
-            throw ToolException.internal(app + " 已发起启动，" + guard.windowTimeout().toMillis() + "ms 内没等到窗口");
+            throw ToolException.internal(app + " 已发起启动，" + windowTimeout.toMillis() + "ms 内没等到窗口");
         }
         return window;
     }

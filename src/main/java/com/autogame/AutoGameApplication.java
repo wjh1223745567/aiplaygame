@@ -1,15 +1,17 @@
 package com.autogame;
 
 import com.autogame.config.AutoGameProperties;
+import com.autogame.game.wendao.WendaoProperties;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 
 /**
- * 桌面自动化工具的入口：应用启动/置顶、截图、鼠标操作、视觉大模型识图。
+ * 桌面自动化工具的入口：应用启动/置顶、截图、鼠标键盘操作、视觉大模型识图，
+ * 以及具体游戏（问道）的登录与日常任务。
  */
 @SpringBootApplication
-@EnableConfigurationProperties(AutoGameProperties.class)
+@EnableConfigurationProperties({AutoGameProperties.class, WendaoProperties.class})
 public class AutoGameApplication {
 
     public static void main(String[] args) {

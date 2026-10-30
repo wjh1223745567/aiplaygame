@@ -5,11 +5,13 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.aop.aspectj.annotation.AspectJProxyFactory;
+import org.springframework.mock.env.MockEnvironment;
 
 import com.autogame.config.AutoGameProperties;
 import com.autogame.platform.WindowInfo;
@@ -59,6 +61,16 @@ class AppGuardAspectTest {
     }
 
     @Test
+    void 占位符先从配置解析成目标应用() {
+        target().fromConfig();
+
+        assertEquals(1, preflight.calls.size());
+        assertEquals("问道", preflight.calls.getFirst()[0]);
+        // 配置里 title 为空 → 不做标题限制
+        assertNull(preflight.calls.getFirst()[1]);
+    }
+
+    @Test
     void 前置保障失败时方法体不执行() {
         preflight.failure = ToolException.locked("鼠标被接管");
         Demo proxy = target();
@@ -86,8 +98,15 @@ class AppGuardAspectTest {
     private Demo target() {
         raw = new Demo();
         AspectJProxyFactory factory = new AspectJProxyFactory(raw);
-        factory.addAspect(new AppGuardAspect(preflight));
+        factory.addAspect(new AppGuardAspect(preflight, environment()));
         return factory.getProxy();
+    }
+
+    /** 只放游戏那段配置，用来验证注解里的 ${...} 占位符。 */
+    private static MockEnvironment environment() {
+        return new MockEnvironment()
+                .withProperty("autogame.game.wendao.app", "问道")
+                .withProperty("autogame.game.wendao.title", "");
     }
 
     public record Req(String app, String title) {
@@ -106,6 +125,12 @@ class AppGuardAspectTest {
 
         @RequiresApp(app = "#request?.app()", title = "#request?.title()")
         public String fromRequest(Req request) {
+            executed++;
+            return "ok";
+        }
+
+        @RequiresApp(app = "${autogame.game.wendao.app}", title = "${autogame.game.wendao.title}")
+        public String fromConfig() {
             executed++;
             return "ok";
         }
@@ -134,6 +159,15 @@ class AppGuardAspectTest {
 
         @Override
         public WindowInfo ensureReady(String app, String title) {
+            return record(app, title);
+        }
+
+        @Override
+        public WindowInfo ensureReady(String app, String title, Duration windowTimeout) {
+            return record(app, title);
+        }
+
+        private WindowInfo record(String app, String title) {
             calls.add(new String[] { app, title });
             if (failure != null) {
                 throw failure;

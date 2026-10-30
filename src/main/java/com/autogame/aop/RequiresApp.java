@@ -16,6 +16,7 @@ import java.lang.annotation.Target;
  *   <li>字面量：{@code @RequiresApp(app = "Calculator")}</li>
  *   <li>表达式（以 # 开头按 SpEL 解析，可引用方法参数名）：{@code @RequiresApp(app = "#request?.app()")}</li>
  * </ul>
+ * 两种写法都支持 {@code ${...}} 配置占位符，例如 {@code @RequiresApp(app = "${autogame.game.wendao.app}")}。
  * 取不到值时（返回 null 或空串）跳过前置保障，视为与桌面无关的纯计算类方法。
  */
 @Target(ElementType.METHOD)
@@ -28,4 +29,10 @@ public @interface RequiresApp {
 
     /** 目标窗口标题关键字，规则同 {@link #app()}；留空表示不限制。 */
     String title() default "";
+
+    /**
+     * 等窗口出现的最长毫秒数；0 表示沿用全局配置 {@code autogame.guard.window-timeout}。
+     * 游戏客户端启动慢，通常要单独给到几十秒。
+     */
+    long windowTimeout() default 0;
 }

@@ -40,6 +40,37 @@ autogame:
     # 检查远程控制类进程；常驻驱动/服务会误报，默认关，仅排查时打开
     detect-hijackers: false
 
+  # 具体游戏：一个游戏一段配置。坐标都是「窗口内比例」（0~1），换机器只改这里
+  game:
+    wendao:
+      # 客户端进程名或 .app 绝对路径；title 是窗口标题关键字，留空表示不限制
+      app: ${WENDAO_APP:问道}
+      title: ${WENDAO_TITLE:}
+      # 账号密码只从环境变量读，不要写进仓库
+      account:
+        user: ${WENDAO_USER:}
+        password: ${WENDAO_PASSWORD:}
+      login:
+        account-box: { x: 0.40, y: 0.44 }
+        password-box: { x: 0.40, y: 0.50 }
+        login-button: { x: 0.40, y: 0.58 }
+        # 登录后「进入游戏 / 选服」与公告「确定」
+        enter-button: { x: 0.50, y: 0.78 }
+        notice-button: { x: 0.50, y: 0.66 }
+        ready-timeout: 3m
+        poll-interval: 3s
+      shimen:
+        # 右侧任务追踪栏里的师门任务条目；点它会自动寻路
+        task-tracker: { x: 0.86, y: 0.18 }
+        # 对话框里的「确定 / 接受 / 交任务」
+        confirm-button: { x: 0.50, y: 0.68 }
+        rounds: 20
+        round-interval: 1s
+        # 战斗中只等不点
+        battle-wait: 5s
+        total-timeout: 45m
+        relogin-limit: 1
+
 logging:
   file:
     name: logs/autogame.log

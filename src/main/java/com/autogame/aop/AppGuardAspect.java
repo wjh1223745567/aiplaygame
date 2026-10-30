@@ -1,6 +1,7 @@
 package com.autogame.aop;
 
 import java.lang.reflect.Method;
+import java.time.Duration;
 
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
@@ -13,6 +14,7 @@ import org.springframework.context.expression.MethodBasedEvaluationContext;
 import org.springframework.core.DefaultParameterNameDiscoverer;
 import org.springframework.core.ParameterNameDiscoverer;
 import org.springframework.core.annotation.AnnotatedElementUtils;
+import org.springframework.core.env.Environment;
 import org.springframework.expression.ExpressionParser;
 import org.springframework.expression.spel.standard.SpelExpressionParser;
 import org.springframework.expression.spel.support.StandardEvaluationContext;
@@ -38,9 +40,11 @@ public class AppGuardAspect {
     private final ExpressionParser parser = new SpelExpressionParser();
     private final ParameterNameDiscoverer parameterNames = new DefaultParameterNameDiscoverer();
     private final AppPreflight appPreflight;
+    private final Environment environment;
 
-    public AppGuardAspect(AppPreflight appPreflight) {
+    public AppGuardAspect(AppPreflight appPreflight, Environment environment) {
         this.appPreflight = appPreflight;
+        this.environment = environment;
     }
 
     @Around("@annotation(com.autogame.aop.RequiresApp)")
@@ -57,7 +61,8 @@ public class AppGuardAspect {
             return joinPoint.proceed();
         }
         String title = resolve(joinPoint, method, annotation.title());
-        WindowInfo window = appPreflight.ensureReady(app, title);
+        WindowInfo window = appPreflight.ensureReady(app, title,
+                annotation.windowTimeout() <= 0 ? null : Duration.ofMillis(annotation.windowTimeout()));
         log.debug("{} 前置保障通过：{}", method.getName(), window);
         return joinPoint.proceed();
     }
@@ -72,7 +77,8 @@ public class AppGuardAspect {
     }
 
     /**
-     * 求值：不以 {@code #} 开头就当字面量，否则按 SpEL 解析，可引用方法参数名（如 {@code #request}）。
+     * 求值：不以 {@code #} 开头就当字面量，否则按 SpEL 解析，可引用方法参数名（如 {@code #request}）；
+     * 两种写法算完都会再解析一次 {@code ${...}} 占位符，方便直接引用配置。
      *
      * @return 求值结果；表达式为空白时返回 null，表示不限制
      */
@@ -81,17 +87,24 @@ public class AppGuardAspect {
             return null;
         }
         String trimmed = expression.trim();
-        if (!trimmed.startsWith("#")) {
-            return trimmed;
+        String value;
+        if (trimmed.startsWith("#")) {
+            StandardEvaluationContext context = new MethodBasedEvaluationContext(
+                    joinPoint.getTarget(), method, joinPoint.getArgs(), parameterNames);
+            try {
+                Object resolved = parser.parseExpression(trimmed).getValue(context);
+                value = resolved == null ? null : resolved.toString();
+            } catch (RuntimeException e) {
+                throw ToolException.badRequest("@RequiresApp 表达式求值失败：" + trimmed + "（" + firstLine(e) + "）");
+            }
+        } else {
+            value = trimmed;
         }
-        StandardEvaluationContext context = new MethodBasedEvaluationContext(
-                joinPoint.getTarget(), method, joinPoint.getArgs(), parameterNames);
-        try {
-            Object value = parser.parseExpression(trimmed).getValue(context);
-            return value == null ? null : value.toString().trim();
-        } catch (RuntimeException e) {
-            throw ToolException.badRequest("@RequiresApp 表达式求值失败：" + trimmed + "（" + firstLine(e) + "）");
+        if (value == null) {
+            return null;
         }
+        String expanded = environment.resolvePlaceholders(value).trim();
+        return expanded.isEmpty() ? null : expanded;
     }
 
     private static String firstLine(RuntimeException e) {
