@@ -29,7 +29,7 @@ public class InputGuard {
     private static final Logger log = LoggerFactory.getLogger(InputGuard.class);
 
     /** 判断「最近的输入是不是自己造的」时允许的时间误差（系统时间戳精度有限）。 */
-    private static final long OWN_INPUT_SLACK_MS = 150;
+    private static final long OWN_INPUT_SLACK_MS = 60;
 
     private final InputActivity inputActivity;
     private final CursorProbe cursorProbe;
@@ -70,11 +70,13 @@ public class InputGuard {
     /**
      * 最近的输入是不是本服务自己合成的。
      *
-     * <p>系统只记录「最后一条输入事件」，探针挪光标、鼠标点击都会刷新它；若两条时间对得上，
-     * 就说明这条输入是自己造的，不能当成人正在操作。时间对不上（人比我后动）才算人工接管。
+     * <p>系统只记录「最后一条输入事件」，探针挪光标、鼠标点击都会刷新它。两个时间是「多少毫秒前」，
+     * 所以比大小就够：人只要在我们之后动过，最后一条事件就比我们自己那条更新，idle 会明显小于
+     * synthetic，这时必须算人工接管；反过来 idle 更大，说明我们发出去的事件之后没人动过。
+     * 不能只看两者差值的绝对大小，否则「人紧跟着我们的点击再动鼠标」会被当成自己人在动。
      */
     private boolean isOwnInput(long idle) {
         long synthetic = desktopRobot.sinceLastInputMillis();
-        return synthetic >= 0 && Math.abs(idle - synthetic) <= OWN_INPUT_SLACK_MS;
+        return synthetic >= 0 && idle + OWN_INPUT_SLACK_MS >= synthetic;
     }
 }
